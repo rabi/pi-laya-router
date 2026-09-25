@@ -6,7 +6,8 @@
  * - config.ts     JSONC config loading, deep merge, env override, validation
  * - client.ts     laya-serve HTTP client (/v1/systemone, /health)
  * - classifier.ts prompt -> route bucket via laya choice question
- * - router.ts     RouterState: config lifecycle + model switching
+ * - summarizer.ts  cheap-model transcript digest for model switches
+ * - router.ts     RouterState: sticky / intent-only routing + digest context rewrite
  * - tools.ts      laya_ask / laya_classify / laya_check / laya_score / laya_health
  * - commands.ts   /laya-router subcommand handling
  *
@@ -18,20 +19,22 @@ import { buildTools } from "./laya-router/tools.ts";
 import { handleRouterCommand } from "./laya-router/commands.ts";
 import { RouterState } from "./laya-router/router.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-
 export default function (pi: ExtensionAPI) {
 	const state = new RouterState();
+	// the digest call itself must not be routed or re-summarised
+	let summarizing = false;
 
 	for (const tool of buildTools(() => state.cfg)) pi.registerTool(tool);
 
 	pi.on("session_start", async (_event, ctx) => {
+		state.resetSession();
 		state.reload(ctx.cwd, ctx);
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!state.cfg || !state.enabled || !event.prompt.trim()) return;
 		try {
-			const decision = await state.route(
+			const result = await state.route(
 				ctx,
 				event.prompt,
 				(m) => pi.setModel(m),
@@ -39,7 +42,7 @@ export default function (pi: ExtensionAPI) {
 				() => pi.getThinkingLevel(),
 				ctx.signal,
 			);
-			if (decision) ctx.ui.notify(`laya-router: ${state.lastDecision}`, "info");
+			if (result) ctx.ui.notify(`laya-router: ${state.lastDecision}`, "info");
 		} catch (err) {
 			if (err instanceof Error && err.name === "AbortError") return;
 			ctx.ui.notify(
@@ -47,6 +50,16 @@ export default function (pi: ExtensionAPI) {
 				"warning",
 			);
 		}
+	});
+
+	pi.on("context", async (event, ctx) => {
+		if (!state.cfg || !state.enabled || summarizing) return undefined;
+		summarizing = true;
+		try {
+			return await state.transformContext(event.messages, ctx.signal);
+		}
+		catch { return undefined; }
+		finally { summarizing = false; }
 	});
 
 	pi.registerCommand("laya-router", {

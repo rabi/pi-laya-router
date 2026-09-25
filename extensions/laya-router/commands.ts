@@ -9,6 +9,7 @@ const USAGE = [
 	"/laya-router on|off      toggle auto-routing",
 	"/laya-router reload      re-read router.json",
 	"/laya-router routes      routing table + last decision",
+	"/laya-router reroute     drop the session lock; next prompt re-classifies",
 	"/laya-router test <text> classify without switching",
 	"/laya-router health      ping remote laya-serve",
 ].join("\n");
@@ -28,6 +29,11 @@ export async function handleRouterCommand(args: string, ctx: ExtensionContext, s
 		case arg === "off": {
 			state.setEnabled(arg === "on");
 			notify(`laya-router: auto-routing ${arg}`, "info");
+			return;
+		}
+		case arg === "reroute": {
+			state.unlock();
+			notify("laya-router: session lock cleared — next prompt re-classifies", "info");
 			return;
 		}
 		case arg === "reload": {
@@ -77,9 +83,10 @@ export async function handleRouterCommand(args: string, ctx: ExtensionContext, s
 			}
 			notify(
 				[
-					`routing: ${state.enabled ? "on" : "off"}`,
+					`routing: ${state.enabled ? "on" : "off"} (mode: ${state.routingMode()})`,
 					`serve: ${state.cfg!.serveUrl} (model ${state.cfg!.model ?? "laya"})`,
 					`routes: ${Object.keys(state.cfg!.routes).join(", ")}`,
+					state.currentBucket ? `current: ${state.currentBucket}` : "",
 					`config: ${state.configPaths.join(", ") || "(none)"}`,
 					`toggle with /laya-router on|off`,
 				].join("\n"),

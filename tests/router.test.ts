@@ -35,8 +35,25 @@ const getThinking = (level: ThinkingLevel): (() => ThinkingLevel) => () => level
 function stubAnswer(choice: string, confidence: number) {
 	const original = globalThis.fetch;
 	globalThis.fetch = (async () =>
-		new Response(JSON.stringify({ answers: { route: { choice, confidence } } }), { status: 200 })) as typeof fetch;
+		new Response(JSON.stringify({ answers: { route: { choice, answer_confidence: confidence } } }), { status: 200 })) as typeof fetch;
 	return () => (globalThis.fetch = original);
+}
+
+/** Stub a probabilities map (what scoreRoutes reads) for switch-policy tests. */
+function stubScores(probs: Record<string, number>, choice?: string) {
+	const original = globalThis.fetch;
+	globalThis.fetch = (async () =>
+		new Response(
+			JSON.stringify({ answers: { route: { choice: choice ?? Object.entries(probs).sort((a, b) => b[1] - a[1])[0][0], probabilities: probs } } }),
+			{ status: 200 },
+		)) as typeof fetch;
+	return () => (globalThis.fetch = original);
+}
+
+function stateWith(cfg: RouterConfig) {
+	const state = new RouterState();
+	state.cfg = structuredClone(cfg);
+	return state;
 }
 
 describe("RouterState.route", () => {
@@ -55,7 +72,8 @@ describe("RouterState.route", () => {
 		const setThinking = mock(() => {});
 
 		const d = await state.route(ctx, "implement auth", setModel, setThinking, getThinking("off"));
-		expect(d?.bucket).toBe("code");
+		expect(d?.decision.bucket).toBe("code");
+		expect(d?.switched).toBe(true);
 		expect(setModel).toHaveBeenCalledTimes(1);
 		expect((setModel.mock.calls[0][0] as Model<any>).id).toBe("opus");
 		expect(setThinking.mock.calls[0][0]).toBe("high");
@@ -72,7 +90,8 @@ describe("RouterState.route", () => {
 		const setThinking = mock(() => {});
 
 		const d = await state.route(ctx, "x", setModel, setThinking, getThinking("off"));
-		expect(d?.bucket).toBe("code");
+		expect(d?.decision.bucket).toBe("code");
+		expect(d?.switched).toBe(false);
 		expect(setModel).not.toHaveBeenCalled();
 		expect(setThinking.mock.calls[0][0]).toBe("high");
 		expect(state.lastDecision).toContain("code");
@@ -163,6 +182,184 @@ describe("manual toggle survives reload", () => {
 
 		await handleRouterCommand("on", ctx, state);
 		expect(state.enabled).toBe(true);
+	});
+});
+
+describe("session lock (sticky routing)", () => {
+	test("first prompt locks; later prompts are not classified", async () => {
+		let calls = 0;
+		const original = globalThis.fetch;
+		globalThis.fetch = (async () => {
+			calls++;
+			return new Response(JSON.stringify({ answers: { route: { choice: "code", answer_confidence: 0.9 } } }), { status: 200 });
+		}) as typeof fetch;
+		const state = stateWith({ ...CFG, routing: { stickySession: true } });
+		const { ctx } = mockCtx(undefined);
+		const setModel = mock(async () => true);
+
+		const first = await state.route(ctx, "implement auth", setModel, mock(() => {}), getThinking("off"));
+		expect(first?.decision.bucket).toBe("code");
+		expect(await state.route(ctx, "what is the capital of France", setModel, mock(() => {}), getThinking("off"))).toBeUndefined();
+		expect(calls).toBe(1);
+
+		state.unlock();
+		await state.route(ctx, "what is the capital of France", setModel, mock(() => {}), getThinking("off"));
+		expect(calls).toBe(2);
+		globalThis.fetch = original;
+	});
+
+	test("resetSession clears bucket and mode defaults to classify", () => {
+		const state = stateWith(CFG);
+		state.currentBucket = "code";
+		state.resetSession();
+		expect(state.currentBucket).toBeUndefined();
+		expect(state.routingMode()).toBe("classify");
+	});
+});
+
+describe("intent-only routing (switch policy)", () => {
+	test("challenger within margin keeps incumbent", async () => {
+		const restore = stubScores({ quick: 0.4, code: 0.48 });
+		const state = stateWith({ ...CFG, routing: { switchPolicy: { minMargin: 0.15 } } });
+		state.currentBucket = "quick";
+		const { ctx } = mockCtx({ id: "mini", provider: "openai" } as Model<any>);
+		const setModel = mock(async () => true);
+
+		const r = await state.route(ctx, "slightly technical ask", setModel, mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("quick");
+		expect(r?.switched).toBe(false);
+		expect(setModel).not.toHaveBeenCalled();
+		restore();
+	});
+
+	test("challenger beyond margin switches", async () => {
+		const restore = stubScores({ quick: 0.2, code: 0.7 });
+		const state = stateWith({ ...CFG, routing: { switchPolicy: { minMargin: 0.15 } } });
+		state.currentBucket = "quick";
+		const { ctx } = mockCtx({ id: "mini", provider: "openai" } as Model<any>);
+		const setModel = mock(async () => true);
+
+		const r = await state.route(ctx, "write a parser", setModel, mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("code");
+		expect(r?.switched).toBe(true);
+		restore();
+	});
+
+	test("no confident route keeps incumbent (gated)", async () => {
+		const restore = stubScores({ quick: 0.1, code: 0.12 });
+		const state = stateWith({ ...CFG, routing: { switchPolicy: { minMargin: 0.15, minAbsolute: 0.3 } } });
+		state.currentBucket = "code";
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" } as Model<any>);
+
+		const r = await state.route(ctx, "hmm", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("code");
+		expect(r?.decision.gated).toBe(true);
+		restore();
+	});
+
+	test("first prompt with no incumbent routes normally", async () => {
+		const restore = stubScores({ quick: 0.2, code: 0.7 });
+		const state = stateWith({ ...CFG, routing: { switchPolicy: {} } });
+		const { ctx } = mockCtx(undefined);
+		const r = await state.route(ctx, "write a parser", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("code");
+		restore();
+	});
+});
+
+describe("stateful summarisation (context transform)", () => {
+	function history(pairs: number, chars: number) {
+		const msgs: any[] = [];
+		for (let i = 0; i < pairs; i++) {
+			msgs.push({ role: "user", content: `question ${i} ${"u".repeat(chars)}` });
+			msgs.push({ role: "assistant", content: `answer ${i} ${"a".repeat(chars)}` });
+		}
+		return msgs;
+	}
+
+	test("disabled summarizer leaves context untouched", async () => {
+		const state = stateWith(CFG);
+		expect(await state.transformContext([...history(3, 100), { role: "user", content: "next ask" }])).toBeUndefined();
+	});
+
+	test("switch builds digest; request becomes digest + current turn", async () => {
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, minChars: 100 } } });
+		let digestCalls = 0;
+		(state as any).summarize = async () => {
+			digestCalls++;
+			return "DIGEST TEXT";
+		};
+		(state as any).digestPending = true;
+		const msgs = [...history(3, 100), { role: "user", content: "next ask" }];
+
+		const out = await state.transformContext(msgs);
+		expect(digestCalls).toBe(1);
+		expect(out?.messages).toHaveLength(2);
+		expect(out!.messages[0].content).toContain("DIGEST TEXT");
+		expect(out!.messages[1].content).toBe("next ask");
+
+		// later LLM calls in the same turn reuse the digest — no re-summarise
+		const again = await state.transformContext([...msgs, { role: "assistant", content: "working" }]);
+		expect(digestCalls).toBe(1);
+		expect(again?.messages[0].content).toContain("DIGEST TEXT");
+	});
+
+	test("history below minChars clears the one-shot flag", async () => {
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, minChars: 10000 } } });
+		let calls = 0;
+		(state as any).summarize = async () => {
+			calls++;
+			return "x";
+		};
+		(state as any).digestPending = true;
+		expect(await state.transformContext([...history(1, 10), { role: "user", content: "ask" }])).toBeUndefined();
+		expect(calls).toBe(0);
+		expect((state as any).digestPending).toBe(false);
+	});
+
+	test("history not covered by the digest stays in the request", async () => {
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, minChars: 50 } } });
+		(state as any).summarize = async () => "D";
+		(state as any).digest = "D";
+		(state as any).digestCovered = 2; // digest covers only first history msg
+		const msgs = [...history(3, 100), { role: "user", content: "ask" }];
+		const out = await state.transformContext(msgs);
+		// digest + 4 uncovered history msgs + current ask
+		expect(out!.messages[0].content).toContain("[laya-router conversation digest]");
+		expect(out!.messages.length).toBe(6);
+		expect(out!.messages[out!.messages.length - 1].content).toBe("ask");
+	});
+
+	test("summariser failures stop after 2 and never drop the current turn", async () => {
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, minChars: 50 } } });
+		let calls = 0;
+		(state as any).summarize = async () => {
+			calls++;
+			throw new Error("model down");
+		};
+		(state as any).digestPending = true;
+		const msgs = [...history(3, 100), { role: "user", content: "ask" }];
+		expect(await state.transformContext(msgs)).toBeUndefined();
+		expect(await state.transformContext(msgs)).toBeUndefined();
+		expect(calls).toBe(2);
+		// capped: third call must not invoke the summariser at all
+		expect(await state.transformContext(msgs)).toBeUndefined();
+		expect(calls).toBe(2);
+	});
+
+	test("refresh after refreshTurns uncovered user messages", async () => {
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, minChars: 50, refreshTurns: 2 } } });
+		let calls = 0;
+		(state as any).summarize = async () => {
+			calls++;
+			return `D${calls}`;
+		};
+		(state as any).digest = "D0";
+		const msgs = [...history(5, 100), { role: "user", content: "extra1" }, { role: "assistant", content: "a1" }, { role: "user", content: "extra2" }, { role: "assistant", content: "a2" }, { role: "user", content: "ask" }];
+		(state as any).digestCovered = 10; // original digest covered the first 5 pairs
+		const out = await state.transformContext(msgs);
+		expect(calls).toBe(1);
+		expect(out!.messages[0].content).toContain("D1");
 	});
 });
 

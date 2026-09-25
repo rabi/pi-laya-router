@@ -16,6 +16,20 @@ Decision tools (single forward pass, ~1 s):
 
 Automatic model routing (on by default when `router.json` exists): before each agent run the user prompt is classified into one of your route buckets and pi switches the active model via `pi.setModel()`. Set `routing.enabled: false` or `/laya-router off` to disable. Manual `/model` choice is overridden per turn while routing is on.
 
+### Routing strategies
+
+Pick one — they share the same laya classifier and confidence gate:
+
+| Strategy | Config | Behavior |
+|---|---|---|
+| Classify-every-prompt (default) | — | Every prompt re-routes. Simplest; maximum misroute surface, cache thrash on flip-flops. |
+| Session lock | `"stickySession": true` | First prompt picks the model; the rest of the session rides it. Maximum prompt-cache hits. Escape hatch: `/laya-router reroute`. |
+| Intent-only | `"switchPolicy": { "minMargin": 0.15 }` | Every prompt is scored, but the model switches only when a challenger beats the incumbent's score by `minMargin`. Prompts that match nothing (`< minAbsolute`) keep the incumbent. |
+
+### Stateful summarisation (optional, any strategy)
+
+`routing.summarizer` names a cheap model (provider/model, auth resolved through pi's registry). When a routing decision actually changes the model — the new model's prompt cache is cold anyway — the plugin digests the prior transcript with that cheap model and reshapes every subsequent request as `[digest] + [uncovered history] + [current turn]`. The stored session transcript is never modified; only the outbound request is compacted, and it re-applies per LLM call (tool loops included). The digest refreshes after `refreshTurns` new user turns; summariser failures degrade gracefully (original transcript, retried twice, then abandoned).
+
 ## Install
 
 ```bash
@@ -56,6 +70,7 @@ Files are merged per-key (`routes`/`routing` merged per-entry), accept `//` and 
 - `/laya-router on|off` — toggle auto-routing
 - `/laya-router reload` — re-read router.json without restarting pi
 - `/laya-router routes` — routing table + last decision
+- `/laya-router reroute` — drop the session lock; next prompt re-classifies (sticky mode)
 - `/laya-router test <text>` — classify without switching (shows confidence and whether the default-route gate fired)
 - `/laya-router health` — ping remote laya-serve
 
@@ -68,8 +83,9 @@ extensions/
     types.ts              # shared interfaces + defaults
     config.ts             # JSONC load, deep merge, env override, validation
     client.ts             # /v1/systemone + /health HTTP client (abort-aware)
-    classifier.ts         # prompt -> route bucket via laya choice question
-    router.ts             # RouterState: config lifecycle + model switching
+    classifier.ts         # prompt -> route bucket via laya choice question (+ scoreRoutes for switch policy)
+    summarizer.ts         # cheap-model transcript digest for model switches
+    router.ts             # RouterState: sticky/intent routing, digest context rewrite
     tools.ts              # the five decision tools
     commands.ts           # /laya-router subcommands
 ```

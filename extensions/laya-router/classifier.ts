@@ -4,6 +4,10 @@ import type { Decision, RouterConfig } from "./types.ts";
 
 export const CLASSIFY_INSTRUCTIONS = "Which category best fits this request?";
 
+export const SWITCH_INSTRUCTIONS =
+	"Score which category best fits the user's LATEST REQUEST, judged independently of any earlier conversation. " +
+	"If no category fits well, choose the cheapest one.";
+
 export function routeCriteria(cfg: RouterConfig): Record<string, string> {
 	const out: Record<string, string> = {};
 	for (const [name, route] of Object.entries(cfg.routes)) out[name] = route.description;
@@ -45,7 +49,7 @@ export async function classify(
 	signal?: AbortSignal,
 ): Promise<Decision | undefined> {
 	const state = classifyState(prompt, maxPromptChars(cfg));
-	const data = await layaAsk<{ answers: Record<string, { choice?: string; confidence?: number; answer_confidence?: number }> }>(
+	const data = await layaAsk<{ answers: Record<string, { choice?: string; confidence?: number; answer_confidence?: number; probabilities?: Record<string, number> }> }>(
 		cfg,
 		{
 			state,
@@ -73,4 +77,36 @@ export async function classify(
 	}
 	if (!cfg.routes[bucket]) return undefined;
 	return { bucket, confidence, gated, route: cfg.routes[bucket] };
+}
+
+/**
+ * Score every route for the prompt in one laya pass (probability map + the
+ * chosen label's answer_confidence). Switch-policy compares the incumbent
+ * route against the challenger without a second request.
+ */
+export async function scoreRoutes(cfg: RouterConfig, prompt: string, signal?: AbortSignal): Promise<Map<string, number>> {
+	const state = classifyState(prompt, maxPromptChars(cfg));
+	const data = await layaAsk<{
+		answers: Record<string, { choice?: string; confidence?: number; answer_confidence?: number; probabilities?: Record<string, number> }>;
+	}>(
+		cfg,
+		{
+			state,
+			questions: { route: { type: "choice", instructions: SWITCH_INSTRUCTIONS, criteria: routeCriteria(cfg) } },
+		},
+		signal,
+	);
+	const ans = data.answers?.route;
+	const scores = new Map<string, number>();
+	const probs = ans?.probabilities;
+	if (probs && typeof probs === "object") {
+		for (const b of Object.keys(cfg.routes)) {
+			if (typeof probs[b] === "number") scores.set(b, probs[b]);
+		}
+	}
+	if (typeof ans?.choice === "string" && cfg.routes[ans.choice] && !scores.has(ans.choice)) {
+		const ac = ans.answer_confidence ?? ans.confidence;
+		if (typeof ac === "number") scores.set(ans.choice, ac);
+	}
+	return scores;
 }
