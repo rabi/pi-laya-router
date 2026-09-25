@@ -34,8 +34,12 @@ export interface RoutingConfig {
 	maxPromptChars?: number;
 	/** session lock: classify first prompt, then ride it out (sticky) */
 	stickySession?: boolean;
-	/** intent-only: re-classify each prompt, switch only when clearly better */
-	switchPolicy?: SwitchPolicyConfig;
+	/**
+	 * Default mode (unless stickySession): re-classify each prompt, switch only
+	 * when a challenger beats the incumbent by minMargin. Set to false to opt
+	 * back into raw classify-every-prompt routing (switch on any change).
+	 */
+	switchPolicy?: SwitchPolicyConfig | false;
 	/** stateful summarisation: replace history with a cheap-model digest on switch */
 	summarizer?: SummarizerConfig;
 }

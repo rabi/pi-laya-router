@@ -22,9 +22,11 @@ Pick one — they share the same laya classifier and confidence gate:
 
 | Strategy | Config | Behavior |
 |---|---|---|
-| Classify-every-prompt (default) | — | Every prompt re-routes. Simplest; maximum misroute surface, cache thrash on flip-flops. |
+| Intent-only (default) | — | Every prompt is scored, but the model switches only when a challenger beats the incumbent's score by `minMargin` (default 0.15). Prompts that match nothing (`< minAbsolute`) keep the incumbent. Tune with `"switchPolicy": { "minMargin": ..., "minAbsolute": ... }`. |
 | Session lock | `"stickySession": true` | First prompt picks the model; the rest of the session rides it. Maximum prompt-cache hits. Escape hatch: `/laya-router reroute`. |
-| Intent-only | `"switchPolicy": { "minMargin": 0.15 }` | Every prompt is scored, but the model switches only when a challenger beats the incumbent's score by `minMargin`. Prompts that match nothing (`< minAbsolute`) keep the incumbent. |
+| Classify-every-prompt | `"switchPolicy": false` | Every prompt re-routes, switching on any classification change — no margin gate. Maximum misroute surface, cache thrash on flip-flops. |
+
+`stickySession` takes precedence when both are set. Thin margins are exactly where laya's near-chance signal is worst, so the intent gate is the safer default.
 
 ### Stateful summarisation (optional, any strategy)
 

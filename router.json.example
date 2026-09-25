@@ -12,24 +12,26 @@
     // model so its prompt cache stays warm. /laya-router reroute re-classifies.
     "stickySession": false,
 
-    // Intent-only routing (alternative to stickySession): re-classify each
-    // prompt but switch only when the challenger clearly beats the incumbent.
+    // Intent-only routing is the DEFAULT: re-classify each prompt but switch
+    // only when the challenger clearly beats the incumbent. These knobs are
+    // optional — set them only to tune the defaults.
     // "switchPolicy": {
     //   "minMargin": 0.15,     // score gap required to leave the current route
     //   "minAbsolute": 0.3     // below this the prompt matches nothing; stay put
     // },
+    // "switchPolicy": false   // opt out: raw classify-every-prompt routing,
+    //                         // switches on any classification change (no gate)
 
-    // Stateful summarisation: on a real model switch, replace old history with
-    // a cheap-model digest in each request (stored transcript untouched).
+    // Cheap-model compaction: on a real model switch, triggers pi's native
+    // compaction but intercepts it to use this model for the summary instead
+    // of the (potentially expensive) current model.
     // "summarizer": {
     //   "enabled": true,
     //   "provider": "rhcorp",
     //   "model": "Qwen/Qwen3.8-27B-FP8",
     //   "thinkingLevel": "low",
     //   "maxTokens": 1024,
-    //   "minChars": 12000,       // don't digest transcripts smaller than this
-    //   "maxInputChars": 60000,
-    //   "refreshTurns": 5        // re-digest after this many new user turns
+    //   "timeoutMs": 30000
     // }
   },
   "routes": {

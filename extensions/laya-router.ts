@@ -1,13 +1,16 @@
 /**
  * pi-laya-router — Laya decision tools + prompt-based model routing for pi.
  *
+ * On model switch, triggers pi's native compaction (intercepted via
+ * session_before_compact to route the summary through a cheap model).
+ *
  * Structure:
  * - types.ts      shared interfaces + defaults
  * - config.ts     JSONC config loading, deep merge, env override, validation
  * - client.ts     laya-serve HTTP client (/v1/systemone, /health)
  * - classifier.ts prompt -> route bucket via laya choice question
  * - summarizer.ts  cheap-model transcript digest for model switches
- * - router.ts     RouterState: sticky / intent-only routing + digest context rewrite
+ * - router.ts     RouterState: sticky / intent-only routing + compact trigger
  * - tools.ts      laya_ask / laya_classify / laya_check / laya_score / laya_health
  * - commands.ts   /laya-router subcommand handling
  *
@@ -19,10 +22,10 @@ import { buildTools } from "./laya-router/tools.ts";
 import { handleRouterCommand } from "./laya-router/commands.ts";
 import { RouterState } from "./laya-router/router.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
+
 export default function (pi: ExtensionAPI) {
 	const state = new RouterState();
-	// the digest call itself must not be routed or re-summarised
-	let summarizing = false;
 
 	for (const tool of buildTools(() => state.cfg)) pi.registerTool(tool);
 
@@ -31,10 +34,45 @@ export default function (pi: ExtensionAPI) {
 		state.reload(ctx.cwd, ctx);
 	});
 
-	// pi rebuilt the transcript (compaction summary or /tree navigation) —
-	// message indices the digest was anchored to no longer line up
-	pi.on("session_compact", async () => state.resetDigest());
-	pi.on("session_tree", async () => state.resetDigest());
+	pi.on("session_compact", async (event) => {
+		state.compactingForSwitch = false;
+	});
+
+	pi.on("session_before_compact", async (event, ctx) => {
+		// Only intercept when this compaction was triggered by a model switch
+		// (always reason "manual") AND we have a cheap summarizer configured.
+		// Otherwise let pi do its default.
+		if (!state.compactingForSwitch || event.reason !== "manual" || !state.summarize) return undefined;
+
+		const { preparation, signal } = event;
+		try {
+			// Serialize all messages to be summarized (including split-turn prefix)
+			const allMessages = [
+				...preparation.messagesToSummarize,
+				...preparation.turnPrefixMessages,
+			];
+			if (allMessages.length === 0) return undefined;
+
+			const transcript = serializeConversation(convertToLlm(allMessages));
+			const { summary, usage } = await state.summarize(transcript, preparation.previousSummary, signal);
+
+			return {
+				compaction: {
+					summary,
+					firstKeptEntryId: preparation.firstKeptEntryId,
+					tokensBefore: preparation.tokensBefore,
+					usage,
+				},
+			};
+		} catch (err) {
+			ctx.ui.notify(
+				`laya-router: cheap-model compaction failed, falling back to default (${String(err).slice(0, 120)})`,
+				"warning",
+			);
+			// Return undefined → pi does its default compaction with the current model
+			return undefined;
+		}
+	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!state.cfg || !state.enabled || !event.prompt.trim()) return;
@@ -55,16 +93,6 @@ export default function (pi: ExtensionAPI) {
 				"warning",
 			);
 		}
-	});
-
-	pi.on("context", async (event, ctx) => {
-		if (!state.cfg || !state.enabled || summarizing) return undefined;
-		summarizing = true;
-		try {
-			return await state.transformContext(event.messages, ctx.signal);
-		}
-		catch { return undefined; }
-		finally { summarizing = false; }
 	});
 
 	pi.registerCommand("laya-router", {

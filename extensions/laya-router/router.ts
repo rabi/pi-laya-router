@@ -1,37 +1,19 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ConfigError, loadConfig } from "./config.ts";
 import { classify, scoreRoutes } from "./classifier.ts";
-import { digestMergePrompt, digestPrompt, makeSummarizer, transcriptChars, transcriptTurns, type SummarizeFn } from "./summarizer.ts";
+import { makeSummarizer, type SummarizeFn } from "./summarizer.ts";
 import { DEFAULTS, type Decision, type RouterConfig, type ThinkingLevel } from "./types.ts";
 
-export const DIGEST_MARKER = "[laya-router conversation digest]";
+// pi's prepareCompaction() only yields a non-empty preparation once the
+// summarized span passes its keepRecentTokens budget (default 20k); below
+// that compact() throws "Nothing to compact (session too small)".
+const COMPACT_MIN_TOKENS = 20000;
 
 export type RoutingMode = "classify" | "sticky" | "intent";
 
 export interface RouteResult {
 	decision: Decision;
-	/** true when the model actually changed */
 	switched: boolean;
-}
-
-function digestMessage(digest: string): any {
-	return { role: "user", content: `${DIGEST_MARKER}\n${digest}`, timestamp: Date.now() };
-}
-
-function isDigestMessage(m: any): boolean {
-	if (m?.role !== "user") return false;
-	return typeof m.content === "string" && m.content.startsWith(DIGEST_MARKER);
-}
-
-function countUserTurns(messages: readonly any[]): number {
-	return messages.filter((m: any) => m?.role === "user" && !isDigestMessage(m)).length;
-}
-
-function lastUserIndex(messages: readonly any[]): number {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		if (messages[i]?.role === "user" && !isDigestMessage(messages[i])) return i;
-	}
-	return -1;
 }
 
 export class RouterState {
@@ -39,18 +21,14 @@ export class RouterState {
 	configPaths: string[] = [];
 	enabled = false;
 	lastDecision = "";
-	/** bucket of the route currently applied to this session */
 	currentBucket: string | undefined;
 	private warnedOnce = false;
 	private manualToggle: boolean | undefined;
 	private baselineThinkingLevel: ThinkingLevel | undefined;
 	private locked = false;
-	private summarize: SummarizeFn | undefined;
-	private digest: string | undefined;
-	/** how many leading history messages are folded into `digest` */
-	private digestCovered = 0;
-	private digestPending = false;
-	private digestFailures = 0;
+	summarize: SummarizeFn | undefined;
+	/** set when we triggered compact for a model switch; consumed by session_before_compact */
+	compactingForSwitch = false;
 
 	setEnabled(on: boolean): void {
 		this.manualToggle = on;
@@ -69,7 +47,7 @@ export class RouterState {
 						loaded.config?.routing?.summarizer,
 						(p, m) => ctx.modelRegistry.find(p, m),
 						(m) => ctx.modelRegistry.hasConfiguredAuth(m),
-						(m, c, o) => ctx.modelRegistry.complete(m, c, o),
+						(m, c, o) => ctx.modelRegistry.complete(m, c, o) as any,
 					)
 				: undefined;
 			if (!loaded.config && ctx) {
@@ -90,33 +68,19 @@ export class RouterState {
 		}
 	}
 
-	/** Reset per-session state (call on session_start). */
 	resetSession(): void {
 		this.locked = false;
 		this.currentBucket = undefined;
-		this.resetDigest();
 		this.lastDecision = "";
-	}
-
-	/**
-	 * Pi rebuilt the transcript (compaction, /tree navigation) — message indices
-	 * the old digest was anchored to no longer exist. Drop the digest entirely;
-	 * the raw (already compacted) transcript is used until the next switch.
-	 */
-	resetDigest(): void {
-		this.digest = undefined;
-		this.digestCovered = 0;
-		this.digestPending = false;
-		this.digestFailures = 0;
+		this.compactingForSwitch = false;
 	}
 
 	routingMode(): RoutingMode {
 		if (this.cfg?.routing?.stickySession) return "sticky";
-		if (this.cfg?.routing?.switchPolicy) return "intent";
-		return "classify";
+		if (this.cfg?.routing?.switchPolicy === false) return "classify";
+		return "intent";
 	}
 
-	/** Clear the lock so the next prompt re-classifies (manual re-route / toggle on). */
 	unlock(): void {
 		this.locked = false;
 	}
@@ -132,7 +96,6 @@ export class RouterState {
 	): Promise<RouteResult | undefined> {
 		if (!this.cfg) return undefined;
 		const mode = this.routingMode();
-		// session lock: the first prompt chose the model — ride the prompt cache out
 		if (mode === "sticky" && this.locked) return undefined;
 
 		const decision =
@@ -145,7 +108,6 @@ export class RouterState {
 		return { decision, switched };
 	}
 
-	/** Compare incumbent vs challenger in one laya pass; switch only on a clear margin. */
 	private async decideByMargin(prompt: string, signal?: AbortSignal): Promise<Decision | undefined> {
 		const cfg = this.cfg!;
 		const scores = await scoreRoutes(cfg, prompt, signal);
@@ -167,7 +129,6 @@ export class RouterState {
 		let confidence: number;
 		let gated = false;
 		if (best === undefined || bestScore < minAbs) {
-			// nothing confident: keep incumbent, else default — don't thrash
 			bucket = incumbent ?? cfg.defaultRoute ?? "";
 			confidence = bestScore;
 			gated = true;
@@ -177,7 +138,6 @@ export class RouterState {
 			incumbentScore !== undefined &&
 			bestScore - incumbentScore < margin
 		) {
-			// challenger wins but not decisively — incumbent keeps the cache
 			bucket = incumbent;
 			confidence = incumbentScore;
 		} else {
@@ -217,77 +177,27 @@ export class RouterState {
 			setThinkingLevel(this.baselineThinkingLevel);
 		}
 		const switched = !sameModel;
-		// a model switch invalidates the new model's prompt cache anyway —
-		// a cheap-model digest of history beats replaying the raw transcript to it
-		if (switched && this.summarize) this.digestPending = true;
+		if (switched) {
+			// Trigger pi's compaction — the new model's prompt cache is cold anyway,
+			// a compacted transcript beats replaying the full raw history.
+			// The session_before_compact handler intercepts to use the cheap model.
+			// Gate on context size: on a small session pi has nothing to compact and throws.
+			const usage = ctx.getContextUsage?.();
+			if (!this.compactingForSwitch && usage?.tokens != null && usage.tokens >= COMPACT_MIN_TOKENS) {
+				this.compactingForSwitch = true;
+				ctx.compact({
+					customInstructions: "Model switch: preserve current task state, file changes, and open questions.",
+					onComplete: () => {
+						this.compactingForSwitch = false;
+					},
+					onError: () => {
+						this.compactingForSwitch = false;
+					},
+				});
+			}
+		}
 		this.currentBucket = decision.bucket;
 		this.lastDecision = `${decision.bucket} (${decision.confidence.toFixed(2)}${decision.gated ? ", gated" : ""}) -> ${decision.route.provider}/${decision.route.model}`;
 		return switched;
-	}
-
-	/**
-	 * `context` event handler. Once a digest exists, each request becomes
-	 * [digest] + [history not yet covered by it] + [current turn]. The stored
-	 * transcript is untouched — this reshapes the request only, and re-applies
-	 * on every LLM call within the turn (tool loops included).
-	 *
-	 * The digest only ever absorbs the OLDEST prefix that fits the input budget
-	 * (or the previous digest plus uncovered turns on refresh); everything from
-	 * `digestCovered` on stays verbatim, so the cap can shrink the digest but
-	 * never silently drop context.
-	 */
-	async transformContext(messages: readonly any[], signal?: AbortSignal): Promise<{ messages: any[] } | undefined> {
-		const sumCfg = this.cfg?.routing?.summarizer;
-		if (!sumCfg || sumCfg.enabled === false) return undefined;
-
-		const cut = lastUserIndex(messages);
-		if (cut < 0) return undefined;
-		const history = messages.slice(0, cut).filter((m: any) => !isDigestMessage(m));
-		// tool results orphaned from a digested assistant tool-call must not be
-		// left in the uncovered slice — providers reject them
-		const skipOrphans = (idx: number) => {
-			while (history[idx]?.role === "toolResult") idx++;
-			return idx;
-		};
-		this.digestCovered = Math.min(skipOrphans(Math.min(this.digestCovered, history.length)), history.length);
-		const uncoveredOf = () => history.slice(this.digestCovered);
-		let uncovered = uncoveredOf();
-		const refreshTurns = sumCfg.refreshTurns ?? DEFAULTS.summaryRefreshTurns;
-
-		const canSummarize = this.summarize !== undefined && this.digestFailures < 2;
-		// within a turn history is stable, so uncovered stays empty and no re-fire happens
-		const wantBuild =
-			!this.digest && this.digestPending && canSummarize &&
-			transcriptChars(transcriptTurns(history)) >= (sumCfg.minChars ?? DEFAULTS.summaryMinChars);
-		const wantRefresh =
-			!!this.digest && canSummarize &&
-			(this.digestPending || countUserTurns(uncovered) >= refreshTurns);
-
-		if ((wantBuild || wantRefresh) && (wantBuild || uncovered.length > 0)) {
-			const base = wantBuild ? 0 : this.digestCovered;
-			const req =
-				wantRefresh && this.digest
-					? digestMergePrompt(this.digest, transcriptTurns(uncovered), sumCfg.maxInputChars ?? DEFAULTS.summaryMaxInputChars)
-					: digestPrompt(transcriptTurns(history), sumCfg.maxInputChars ?? DEFAULTS.summaryMaxInputChars);
-			if (req) {
-				try {
-					this.digest = await this.summarize!(req.prompt, signal);
-					this.digestCovered = skipOrphans(Math.min(history.length, base + req.covered));
-					this.digestPending = false;
-					uncovered = uncoveredOf();
-				} catch {
-					this.digestFailures += 1;
-					// stale digest + full uncovered tail still loses nothing; stop retrying at >=2
-				}
-			}
-		} else if (!this.digest && this.digestPending && this.summarize) {
-			// history too small to be worth a digest (or retries exhausted) — clear the one-shot flag
-			this.digestPending = false;
-		} else if (this.digest && this.digestPending && uncovered.length === 0) {
-			this.digestPending = false;
-		}
-
-		if (!this.digest) return undefined;
-		return { messages: [digestMessage(this.digest), ...uncovered, ...messages.slice(cut)] };
 	}
 }
