@@ -42,7 +42,7 @@ export class RouterState {
 		}
 	}
 
-	/** Classify prompt and switch model; returns the decision when a switch happened. */
+	/** Classify prompt and switch model/thinking; skips setModel when already on target. */
 	async route(
 		ctx: ExtensionContext,
 		prompt: string,
@@ -61,8 +61,8 @@ export class RouterState {
 			return undefined;
 		}
 		const current = ctx.model;
-		if (current && current.id === model.id && current.provider === model.provider) return undefined;
-		if (!(await setModel(model))) {
+		const sameModel = !!(current && current.id === model.id && current.provider === model.provider);
+		if (!sameModel && !(await setModel(model))) {
 			ctx.ui.notify(`laya-router: no API key for ${decision.route.provider}/${decision.route.model}`, "warning");
 			return undefined;
 		}

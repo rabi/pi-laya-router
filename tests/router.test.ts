@@ -63,15 +63,19 @@ describe("RouterState.route", () => {
 		restore();
 	});
 
-	test("no switch when already on target model", async () => {
+	test("same model skips setModel but still applies thinking and decision", async () => {
 		const restore = stubAnswer("code", 0.9);
 		const state = new RouterState();
 		state.cfg = structuredClone(CFG);
 		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" } as Model<any>);
 		const setModel = mock(async () => true);
+		const setThinking = mock(() => {});
 
-		expect(await state.route(ctx, "x", setModel, mock(() => {}), getThinking("off"))).toBeUndefined();
+		const d = await state.route(ctx, "x", setModel, setThinking, getThinking("off"));
+		expect(d?.bucket).toBe("code");
 		expect(setModel).not.toHaveBeenCalled();
+		expect(setThinking.mock.calls[0][0]).toBe("high");
+		expect(state.lastDecision).toContain("code");
 		restore();
 	});
 

@@ -33,8 +33,9 @@ export function classifyState(prompt: string, limit: number): string {
 		lines.push(t);
 	}
 	const prose = lines.join("\n");
-	if (prose.length >= 20) return prose.slice(0, limit);
-	// no usable prose: tail slice beats head — intent tends to sit at the end
+	// the request lives at the end of long pastes — keep the prose tail
+	if (prose) return prose.slice(-limit);
+	// no prose at all: raw tail still beats head for an embedded ask
 	return prompt.slice(-limit);
 }
 

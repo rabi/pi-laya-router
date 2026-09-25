@@ -144,9 +144,15 @@ describe("classifyState", () => {
 		expect(state).toBe(code.slice(-60));
 	});
 
-	test("mixed prose under threshold falls back to tail slice", () => {
+	test("short prose kept, code payload dropped", () => {
 		const code = "let a = 1; const b = a + 2;\n".repeat(50) + "short ask";
-		const state = classifyState(code, 40);
-		expect(state).toBe(code.slice(-40));
+		expect(classifyState(code, 40)).toBe("short ask");
+	});
+
+	test("long prose keeps the tail where the request lives", () => {
+		const prose = "background detail. ".repeat(100) + "please review this";
+		const state = classifyState(prose, 30);
+		expect(state).toHaveLength(30);
+		expect(state).toEndWith("review this");
 	});
 });
