@@ -15,7 +15,7 @@ export interface RouteResult {
 }
 
 function digestMessage(digest: string): any {
-	return { role: "user", content: `${DIGEST_MARKER}\n${digest}` };
+	return { role: "user", content: `${DIGEST_MARKER}\n${digest}`, timestamp: Date.now() };
 }
 
 function isDigestMessage(m: any): boolean {
@@ -69,6 +69,7 @@ export class RouterState {
 						loaded.config?.routing?.summarizer,
 						(p, m) => ctx.modelRegistry.find(p, m),
 						(m) => ctx.modelRegistry.hasConfiguredAuth(m),
+						(m, c, o) => ctx.modelRegistry.complete(m, c, o),
 					)
 				: undefined;
 			if (!loaded.config && ctx) {
@@ -93,11 +94,20 @@ export class RouterState {
 	resetSession(): void {
 		this.locked = false;
 		this.currentBucket = undefined;
+		this.resetDigest();
+		this.lastDecision = "";
+	}
+
+	/**
+	 * Pi rebuilt the transcript (compaction, /tree navigation) — message indices
+	 * the old digest was anchored to no longer exist. Drop the digest entirely;
+	 * the raw (already compacted) transcript is used until the next switch.
+	 */
+	resetDigest(): void {
 		this.digest = undefined;
 		this.digestCovered = 0;
 		this.digestPending = false;
 		this.digestFailures = 0;
-		this.lastDecision = "";
 	}
 
 	routingMode(): RoutingMode {
@@ -220,6 +230,11 @@ export class RouterState {
 	 * [digest] + [history not yet covered by it] + [current turn]. The stored
 	 * transcript is untouched — this reshapes the request only, and re-applies
 	 * on every LLM call within the turn (tool loops included).
+	 *
+	 * The digest only ever absorbs the OLDEST prefix that fits the input budget
+	 * (or the previous digest plus uncovered turns on refresh); everything from
+	 * `digestCovered` on stays verbatim, so the cap can shrink the digest but
+	 * never silently drop context.
 	 */
 	async transformContext(messages: readonly any[], signal?: AbortSignal): Promise<{ messages: any[] } | undefined> {
 		const sumCfg = this.cfg?.routing?.summarizer;
@@ -228,7 +243,14 @@ export class RouterState {
 		const cut = lastUserIndex(messages);
 		if (cut < 0) return undefined;
 		const history = messages.slice(0, cut).filter((m: any) => !isDigestMessage(m));
-		const uncoveredOf = () => history.slice(Math.min(this.digestCovered, history.length));
+		// tool results orphaned from a digested assistant tool-call must not be
+		// left in the uncovered slice — providers reject them
+		const skipOrphans = (idx: number) => {
+			while (history[idx]?.role === "toolResult") idx++;
+			return idx;
+		};
+		this.digestCovered = Math.min(skipOrphans(Math.min(this.digestCovered, history.length)), history.length);
+		const uncoveredOf = () => history.slice(this.digestCovered);
 		let uncovered = uncoveredOf();
 		const refreshTurns = sumCfg.refreshTurns ?? DEFAULTS.summaryRefreshTurns;
 
@@ -241,23 +263,27 @@ export class RouterState {
 			!!this.digest && canSummarize &&
 			(this.digestPending || countUserTurns(uncovered) >= refreshTurns);
 
-		if (wantBuild || wantRefresh) {
-			const turns = transcriptTurns(history);
-			const prompt =
+		if ((wantBuild || wantRefresh) && (wantBuild || uncovered.length > 0)) {
+			const base = wantBuild ? 0 : this.digestCovered;
+			const req =
 				wantRefresh && this.digest
-					? digestMergePrompt(this.digest, turns, sumCfg.maxInputChars ?? DEFAULTS.summaryMaxInputChars)
-					: digestPrompt(turns, sumCfg.maxInputChars ?? DEFAULTS.summaryMaxInputChars);
-			try {
-				this.digest = await this.summarize!(prompt, signal);
-				this.digestCovered = history.length;
-				this.digestPending = false;
-				uncovered = uncoveredOf();
-			} catch {
-				this.digestFailures += 1;
-				// stale digest + uncovered tail still loses nothing; stop retrying at >=2
+					? digestMergePrompt(this.digest, transcriptTurns(uncovered), sumCfg.maxInputChars ?? DEFAULTS.summaryMaxInputChars)
+					: digestPrompt(transcriptTurns(history), sumCfg.maxInputChars ?? DEFAULTS.summaryMaxInputChars);
+			if (req) {
+				try {
+					this.digest = await this.summarize!(req.prompt, signal);
+					this.digestCovered = skipOrphans(Math.min(history.length, base + req.covered));
+					this.digestPending = false;
+					uncovered = uncoveredOf();
+				} catch {
+					this.digestFailures += 1;
+					// stale digest + full uncovered tail still loses nothing; stop retrying at >=2
+				}
 			}
-		} else if (!this.digest && this.digestPending && this.summarize && this.digestFailures < 2) {
-			// history too small to be worth a digest — clear the one-shot flag
+		} else if (!this.digest && this.digestPending && this.summarize) {
+			// history too small to be worth a digest (or retries exhausted) — clear the one-shot flag
+			this.digestPending = false;
+		} else if (this.digest && this.digestPending && uncovered.length === 0) {
 			this.digestPending = false;
 		}
 

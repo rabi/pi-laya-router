@@ -330,6 +330,53 @@ describe("stateful summarisation (context transform)", () => {
 		expect(out!.messages[out!.messages.length - 1].content).toBe("ask");
 	});
 
+	test("input cap digests only the oldest prefix and keeps the rest verbatim", async () => {
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, minChars: 50, maxInputChars: 250 } } });
+		const prompts: string[] = [];
+		(state as any).summarize = async (p: string) => {
+			prompts.push(p);
+			return "D";
+		};
+		(state as any).digestPending = true;
+		const msgs = [...history(3, 100), { role: "user", content: "ask" }];
+		const out = await state.transformContext(msgs);
+		// 250-char budget fits only the two oldest history messages
+		expect((state as any).digestCovered).toBe(2);
+		// digest + 4 uncovered history msgs + current ask — nothing dropped
+		expect(out!.messages).toHaveLength(6);
+		expect(out!.messages[5].content).toBe("ask");
+	});
+
+	test("orphan tool results at the coverage boundary get folded into coverage, not left stranded", async () => {
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, minChars: 50 } } });
+		(state as any).summarize = async () => "D";
+		(state as any).digest = "D";
+		(state as any).digestPending = true; // forces a refresh even with few uncovered turns
+		const msgs = [
+			{ role: "user", content: "q with " + "u".repeat(100) },
+			{ role: "assistant", content: [{ type: "toolCall", id: "1", name: "read", arguments: {} }] },
+			{ role: "toolResult", toolCallId: "1", toolName: "read", content: "output " + "o".repeat(100) },
+			{ role: "user", content: "ask" },
+		];
+		const out = await state.transformContext(msgs);
+		// coverage advanced past the orphaned toolResult (index 2) — it must not
+		// sit in the uncovered slice without its tool-call message
+		expect((state as any).digestCovered).toBeGreaterThan(2);
+		expect(out!.messages.some((m: any) => m.role === "toolResult")).toBe(false);
+	});
+
+	test("resetDigest drops stale coverage after pi rebuilds the transcript", async () => {
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, minChars: 50 } } });
+		(state as any).summarize = async () => "D";
+		(state as any).digest = "D";
+		(state as any).digestCovered = 99; // stale index from a pre-compaction transcript
+		state.resetDigest();
+		expect((state as any).digest).toBeUndefined();
+		expect((state as any).digestCovered).toBe(0);
+		// with no digest the handler passes the (compacted) transcript through untouched
+		expect(await state.transformContext([...history(1, 100), { role: "user", content: "ask" }])).toBeUndefined();
+	});
+
 	test("summariser failures stop after 2 and never drop the current turn", async () => {
 		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, minChars: 50 } } });
 		let calls = 0;
@@ -360,6 +407,8 @@ describe("stateful summarisation (context transform)", () => {
 		const out = await state.transformContext(msgs);
 		expect(calls).toBe(1);
 		expect(out!.messages[0].content).toContain("D1");
+		// refresh only absorbs what it actually digested — coverage stays a prefix count
+		expect((state as any).digestCovered).toBe(14);
 	});
 });
 

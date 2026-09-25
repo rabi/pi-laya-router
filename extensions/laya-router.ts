@@ -31,6 +31,11 @@ export default function (pi: ExtensionAPI) {
 		state.reload(ctx.cwd, ctx);
 	});
 
+	// pi rebuilt the transcript (compaction summary or /tree navigation) —
+	// message indices the digest was anchored to no longer line up
+	pi.on("session_compact", async () => state.resetDigest());
+	pi.on("session_tree", async () => state.resetDigest());
+
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!state.cfg || !state.enabled || !event.prompt.trim()) return;
 		try {
