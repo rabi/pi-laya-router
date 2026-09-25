@@ -1,0 +1,18 @@
+{
+  "name": "pi-laya-router",
+  "version": "0.1.0",
+  "description": "Laya decision tools and prompt-based model routing for pi, backed by a remote laya-serve instance",
+  "keywords": ["pi-package", "laya", "model-routing", "mcp"],
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "bun test tests/"
+  },
+  "pi": {
+    "extensions": ["./extensions/laya-router.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  }
+}

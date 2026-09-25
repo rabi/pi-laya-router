@@ -1,0 +1,28 @@
+{
+  "serveUrl": "http://10.37.137.29:8000",
+  "model": "laya",
+  "timeoutMs": 10000,
+  "minConfidence": 0.5,
+  "defaultRoute": "quick",
+  "routing": {
+    "enabled": true,
+    "maxPromptChars": 8000
+  },
+  "routes": {
+    "reasoning": {
+      "provider": "local",
+      "model": "RedHatAI/Qwen3.8-27B-INT4",
+      "description": "Deep reasoning, math, architecture design, hard debugging"
+    },
+    "code": {
+      "provider": "openai",
+      "model": "REPLACE-ME",
+      "description": "Writing, editing, refactoring code; routine implementation tasks"
+    },
+    "quick": {
+      "provider": "openai",
+      "model": "REPLACE-ME",
+      "description": "Simple questions, lookups, small talk, one-line answers"
+    }
+  }
+}
