@@ -18,7 +18,19 @@ const CFG: RouterConfig = {
 	},
 };
 
-function mockCtx(model?: Model<any>, contextTokens: number | null = 50000) {
+const BIG = "x".repeat(120000); // ~30k tokens — clears the 20k keepRecentTokens budget
+
+/** Build a mock session projection: `turns` user/assistant pairs, each user msg sized to clear the compaction budget. */
+function projectionFor(turns: number, content = BIG) {
+	const entries = [];
+	for (let i = 0; i < turns; i++) {
+		entries.push({ sourceEntry: { type: "message" }, messages: [{ role: "user", content }] });
+		entries.push({ sourceEntry: { type: "message" }, messages: [{ role: "assistant", content: "ok" }] });
+	}
+	return { entries };
+}
+
+function mockCtx(model?: Model<any>, projection: ReturnType<typeof projectionFor> = projectionFor(2)) {
 	const notifications: [string, string?][] = [];
 	const compactCalls: any[] = [];
 	const ctx = {
@@ -27,7 +39,7 @@ function mockCtx(model?: Model<any>, contextTokens: number | null = 50000) {
 		modelRegistry: {
 			find: (provider: string, id: string) => ({ id, provider }) as Model<any>,
 		},
-		getContextUsage: () => (contextTokens == null ? undefined : { tokens: contextTokens, contextWindow: 200000, percent: 25 }),
+		sessionManager: { buildSessionProjection: () => projection },
 		compact: (opts?: any) => { compactCalls.push(opts); },
 	} as unknown as ExtensionContext;
 	return { ctx, notifications, compactCalls };
@@ -388,11 +400,11 @@ describe("model switch triggers compaction", () => {
 		restore();
 	});
 
-	test("small session does not trigger compaction", async () => {
+	test("single-turn session does not trigger compaction", async () => {
 		const restore = stubAnswer("code", 0.9);
 		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, provider: "openai", model: "cheap" } } });
 		state.summarize = async () => ({ summary: "S", usage: undefined });
-		const { ctx, compactCalls } = mockCtx({ id: "mini", provider: "openai" } as Model<any>, 1000);
+		const { ctx, compactCalls } = mockCtx({ id: "mini", provider: "openai" } as Model<any>, projectionFor(1));
 
 		const r = await state.route(ctx, "first prompt", mock(async () => true), mock(() => {}), getThinking("off"));
 		expect(r?.switched).toBe(true);
@@ -401,10 +413,29 @@ describe("model switch triggers compaction", () => {
 		restore();
 	});
 
-	test("unknown context usage does not trigger compaction", async () => {
+	test("small history (under keepRecentTokens) does not trigger compaction", async () => {
 		const restore = stubAnswer("code", 0.9);
 		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, provider: "openai", model: "cheap" } } });
-		const { ctx, compactCalls } = mockCtx({ id: "mini", provider: "openai" } as Model<any>, null);
+		const { ctx, compactCalls } = mockCtx({ id: "mini", provider: "openai" } as Model<any>, projectionFor(2, "hi"));
+
+		const r = await state.route(ctx, "first prompt", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.switched).toBe(true);
+		expect(state.compactingForSwitch).toBe(false);
+		expect(compactCalls).toHaveLength(0);
+		restore();
+	});
+
+	test("nothing new since last compaction does not trigger compaction", async () => {
+		const restore = stubAnswer("code", 0.9);
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, provider: "openai", model: "cheap" } } });
+		// retained tail after compaction is large, but only one user turn followed it
+		const projection = {
+			entries: [
+				{ sourceEntry: { type: "compaction" }, messages: [{ role: "user", content: BIG }, { role: "assistant", content: "ok" }, { role: "user", content: BIG }] },
+				{ sourceEntry: { type: "message" }, messages: [{ role: "user", content: "next question" }] },
+			],
+		};
+		const { ctx, compactCalls } = mockCtx({ id: "mini", provider: "openai" } as Model<any>, projection);
 
 		const r = await state.route(ctx, "first prompt", mock(async () => true), mock(() => {}), getThinking("off"));
 		expect(r?.switched).toBe(true);

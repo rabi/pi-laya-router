@@ -1,13 +1,37 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_COMPACTION_SETTINGS, estimateTokens } from "@earendil-works/pi-coding-agent";
 import { ConfigError, loadConfig, maxPromptChars } from "./config.ts";
 import { classify, classifyState, scoreRoutes } from "./classifier.ts";
 import { makeSummarizer, type SummarizeFn } from "./summarizer.ts";
 import { DEFAULTS, type Decision, type RouterConfig, type ThinkingLevel } from "./types.ts";
 
-// pi's prepareCompaction() only yields a non-empty preparation once the
-// summarized span passes its keepRecentTokens budget (default 20k); below
-// that compact() throws "Nothing to compact (session too small)".
-const COMPACT_MIN_TOKENS = 20000;
+/**
+ * Mirror pi's prepareCompaction() no-op condition so compact() never throws
+ * "Nothing to compact (session too small)": the summarizable span — entries
+ * after the latest compaction — needs at least two user turns (below that the
+ * cut never moves past the first cut point) and its message tokens must reach
+ * keepRecentTokens (default 20k), since the cut only advances once the recent
+ * tail fills that budget. Usage-based checks are wrong here: they include the
+ * system prompt + tool schemas, while pi's budget counts session messages only.
+ */
+export function hasCompactableHistory(sessionManager: { buildSessionProjection: () => { entries: { sourceEntry: { type: string }; messages: any[] }[] } }): boolean {
+	try {
+		const entries = sessionManager.buildSessionProjection().entries;
+		const prevCompactionIndex = entries.findIndex((e) => e.sourceEntry.type === "compaction" && e.messages.length > 0);
+		const boundary = prevCompactionIndex >= 0 ? prevCompactionIndex + 1 : 0;
+		let tokens = 0;
+		let userTurns = 0;
+		for (let i = boundary; i < entries.length; i++) {
+			for (const m of entries[i].messages) {
+				tokens += estimateTokens(m);
+				if (m.role === "user") userTurns++;
+			}
+		}
+		return userTurns >= 2 && tokens >= DEFAULT_COMPACTION_SETTINGS.keepRecentTokens;
+	} catch {
+		return false;
+	}
+}
 
 export type RoutingMode = "classify" | "sticky" | "intent";
 
@@ -191,9 +215,9 @@ export class RouterState {
 			// Trigger pi's compaction — the new model's prompt cache is cold anyway,
 			// a compacted transcript beats replaying the full raw history.
 			// The session_before_compact handler intercepts to use the cheap model.
-			// Gate on context size: on a small session pi has nothing to compact and throws.
-			const usage = ctx.getContextUsage?.();
-			if (!this.compactingForSwitch && usage?.tokens != null && usage.tokens >= COMPACT_MIN_TOKENS) {
+			// Gate: pi throws when there is nothing to compact (small session or
+			// nothing new since the last compaction) — mirror its no-op condition.
+			if (!this.compactingForSwitch && ctx.sessionManager && hasCompactableHistory(ctx.sessionManager)) {
 				this.compactingForSwitch = true;
 				ctx.compact({
 					customInstructions: "Model switch: preserve current task state, file changes, and open questions.",

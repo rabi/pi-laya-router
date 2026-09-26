@@ -32,7 +32,7 @@ Pick one — they share the same laya classifier and confidence gate:
 
 ### Switch summarisation (optional, any strategy)
 
-`routing.summarizer` names a cheap model (provider/model, auth resolved through pi's registry). When a routing decision actually changes the model — the new model's prompt cache is cold anyway — the plugin triggers pi's native session compaction and intercepts it to write the summary with the cheap model instead of the (potentially expensive) current one. The compaction only fires once the session is large enough to have anything to compact (≥ 20k context tokens); summariser failures fall back to pi's default compaction. `maxInputChars` (default 60000) caps the transcript fed to the cheap model (newest content kept).
+`routing.summarizer` names a cheap model (provider/model, auth resolved through pi's registry). When a routing decision actually changes the model — the new model's prompt cache is cold anyway — the plugin triggers pi's native session compaction and intercepts it to write the summary with the cheap model instead of the (potentially expensive) current one. The compaction only fires when pi would actually find something to compact — at least two user turns and ≥ `keepRecentTokens` (default 20k) of conversation *since the last compaction*; context from the system prompt or a previous compaction's retained tail doesn't count. Summariser failures fall back to pi's default compaction. `maxInputChars` (default 60000) caps the transcript fed to the cheap model (newest content kept).
 
 ## Install
 

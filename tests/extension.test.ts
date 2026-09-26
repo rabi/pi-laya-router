@@ -51,6 +51,15 @@ function fakePi() {
 
 function fakeCtx(model?: any) {
 	const compactCalls: any[] = [];
+	const big = "x".repeat(120000); // ~30k tokens — clears the 20k compaction budget
+	const projection = {
+		entries: [
+			{ sourceEntry: { type: "message" }, messages: [{ role: "user", content: big }] },
+			{ sourceEntry: { type: "message" }, messages: [{ role: "assistant", content: "ok" }] },
+			{ sourceEntry: { type: "message" }, messages: [{ role: "user", content: big }] },
+			{ sourceEntry: { type: "message" }, messages: [{ role: "assistant", content: "ok" }] },
+		],
+	};
 	return {
 		cwd: "/nonexistent-cwd-for-test",
 		model: model ?? { id: "mini", provider: "openai" },
@@ -61,7 +70,7 @@ function fakeCtx(model?: any) {
 			hasConfiguredAuth: () => true,
 			complete: mock(async () => ({ content: [{ type: "text", text: "SUMMARY" }], stopReason: "stop", usage: { totalTokens: 10 } })),
 		},
-		getContextUsage: () => ({ tokens: 50000, contextWindow: 200000, percent: 25 }),
+		sessionManager: { buildSessionProjection: () => projection },
 		compact: (opts?: any) => { compactCalls.push(opts); },
 		compactCalls,
 	};
