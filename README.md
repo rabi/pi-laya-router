@@ -101,6 +101,8 @@ extensions/
 
 Adding a new decision tool = one `defineTool` in `tools.ts`; adding a route bucket = one entry in `routes`. No other file changes.
 
+Design rationale — why the gates are calibrated the way they are, why floor fallback is next-best-eligible, why compaction mirrors pi's no-op condition — is in [`docs/DESIGN.md`](docs/DESIGN.md).
+
 ## Caveats
 
 - Laya confidence is a concentration statistic over the option distribution, **not** P(answer correct). Use `minConfidence` as a sanity gate, not a correctness guarantee.
