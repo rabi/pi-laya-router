@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ConfigError, loadConfig } from "./config.ts";
-import { classify, scoreRoutes } from "./classifier.ts";
+import { ConfigError, loadConfig, maxPromptChars } from "./config.ts";
+import { classify, classifyState, scoreRoutes } from "./classifier.ts";
 import { makeSummarizer, type SummarizeFn } from "./summarizer.ts";
 import { DEFAULTS, type Decision, type RouterConfig, type ThinkingLevel } from "./types.ts";
 
@@ -97,6 +97,16 @@ export class RouterState {
 		if (!this.cfg) return undefined;
 		const mode = this.routingMode();
 		if (mode === "sticky" && this.locked) return undefined;
+
+		// Tiny followups ("yes, do it") and data-heavy pastes (5KB of logs +
+		// "analyze this") leave only a few words of classifiable prose — the
+		// scores on that are near-noise, so keep the incumbent and skip the
+		// laya round-trip. First prompt always routes (no incumbent to keep).
+		const minSwitch = this.cfg.routing?.minSwitchChars ?? DEFAULTS.minSwitchChars;
+		if (minSwitch > 0 && this.currentBucket && classifyState(prompt, maxPromptChars(this.cfg)).length < minSwitch) {
+			this.lastDecision = `held ${this.currentBucket} (prompt signal < ${minSwitch} chars)`;
+			return undefined;
+		}
 
 		const decision =
 			mode === "intent" ? await this.decideByMargin(prompt, signal) : await classify(this.cfg, prompt, signal);

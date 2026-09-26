@@ -28,9 +28,11 @@ Pick one — they share the same laya classifier and confidence gate:
 
 `stickySession` takes precedence when both are set. Thin margins are exactly where laya's near-chance signal is worst, so the intent gate is the safer default.
 
-### Stateful summarisation (optional, any strategy)
+**Small-signal gate (all strategies).** If the classifiable signal — the prose left after code stripping, i.e. what laya would actually see — is under `minSwitchChars` (default 40), the incumbent model is kept and no laya call is made at all. Tiny followups ("yes, do it") and data-heavy pastes (5KB of logs + "analyze this") are near-noise for switching. The first prompt always routes; `"minSwitchChars": 0` disables the gate.
 
-`routing.summarizer` names a cheap model (provider/model, auth resolved through pi's registry). When a routing decision actually changes the model — the new model's prompt cache is cold anyway — the plugin digests the prior transcript with that cheap model and reshapes every subsequent request as `[digest] + [uncovered history] + [current turn]`. The stored session transcript is never modified; only the outbound request is compacted, and it re-applies per LLM call (tool loops included). The digest refreshes after `refreshTurns` new user turns; summariser failures degrade gracefully (original transcript, retried twice, then abandoned).
+### Switch summarisation (optional, any strategy)
+
+`routing.summarizer` names a cheap model (provider/model, auth resolved through pi's registry). When a routing decision actually changes the model — the new model's prompt cache is cold anyway — the plugin triggers pi's native session compaction and intercepts it to write the summary with the cheap model instead of the (potentially expensive) current one. The compaction only fires once the session is large enough to have anything to compact (≥ 20k context tokens); summariser failures fall back to pi's default compaction. `maxInputChars` (default 60000) caps the transcript fed to the cheap model (newest content kept).
 
 ## Install
 
@@ -86,8 +88,8 @@ extensions/
     config.ts             # JSONC load, deep merge, env override, validation
     client.ts             # /v1/systemone + /health HTTP client (abort-aware)
     classifier.ts         # prompt -> route bucket via laya choice question (+ scoreRoutes for switch policy)
-    summarizer.ts         # cheap-model transcript digest for model switches
-    router.ts             # RouterState: sticky/intent routing, digest context rewrite
+    summarizer.ts         # cheap-model transcript summary for model switches
+    router.ts             # RouterState: sticky/intent routing, small-signal gate, compact trigger
     tools.ts              # the five decision tools
     commands.ts           # /laya-router subcommands
 ```

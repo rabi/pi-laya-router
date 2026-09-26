@@ -22,6 +22,12 @@
     // "switchPolicy": false   // opt out: raw classify-every-prompt routing,
     //                         // switches on any classification change (no gate)
 
+    // If the classifiable signal (prose left after code stripping) is under this
+    // many chars, keep the current model and skip the laya call: tiny followups
+    // ("yes, do it") and data-heavy pastes ("<5KB log>\nanalyze this") are
+    // near-noise for switching. First prompt always routes. 0 disables.
+    // "minSwitchChars": 40
+
     // Cheap-model compaction: on a real model switch, triggers pi's native
     // compaction but intercepts it to use this model for the summary instead
     // of the (potentially expensive) current model.

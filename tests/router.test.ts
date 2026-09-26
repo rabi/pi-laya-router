@@ -135,12 +135,12 @@ describe("RouterState.route", () => {
 		const state = new RouterState();
 		state.cfg = structuredClone(CFG);
 		const { ctx } = mockCtx(undefined);
-		await state.route(ctx, "hard task", mock(async () => true), setThinking, getThinking("minimal"));
+		await state.route(ctx, "implement the auth middleware for the api", mock(async () => true), setThinking, getThinking("minimal"));
 		restore1();
 		expect(setThinking.mock.calls[0][0]).toBe("high");
 
 		const restore2 = stubAnswer("quick", 0.9);
-		await state.route(ctx, "easy task", mock(async () => true), setThinking, getThinking("minimal"));
+		await state.route(ctx, "summarise the release notes for the blog", mock(async () => true), setThinking, getThinking("minimal"));
 		restore2();
 		expect(setThinking).toHaveBeenCalledTimes(2);
 		expect(setThinking.mock.calls[1][0]).toBe("minimal");
@@ -206,7 +206,7 @@ describe("session lock (sticky routing)", () => {
 		expect(calls).toBe(1);
 
 		state.unlock();
-		await state.route(ctx, "what is the capital of France", setModel, mock(() => {}), getThinking("off"));
+		await state.route(ctx, "what is the capital of France and its largest airport", setModel, mock(() => {}), getThinking("off"));
 		expect(calls).toBe(2);
 		globalThis.fetch = original;
 	});
@@ -233,7 +233,7 @@ describe("intent-only routing (switch policy)", () => {
 		const { ctx } = mockCtx({ id: "mini", provider: "openai" } as Model<any>);
 		const setModel = mock(async () => true);
 
-		const r = await state.route(ctx, "slightly technical ask", setModel, mock(() => {}), getThinking("off"));
+		const r = await state.route(ctx, "explain the difference between these two data structures", setModel, mock(() => {}), getThinking("off"));
 		expect(r?.decision.bucket).toBe("quick");
 		expect(r?.switched).toBe(false);
 		expect(setModel).not.toHaveBeenCalled();
@@ -247,7 +247,7 @@ describe("intent-only routing (switch policy)", () => {
 		const { ctx } = mockCtx({ id: "mini", provider: "openai" } as Model<any>);
 		const setModel = mock(async () => true);
 
-		const r = await state.route(ctx, "write a parser", setModel, mock(() => {}), getThinking("off"));
+		const r = await state.route(ctx, "write a recursive descent parser for this grammar", setModel, mock(() => {}), getThinking("off"));
 		expect(r?.decision.bucket).toBe("code");
 		expect(r?.switched).toBe(true);
 		restore();
@@ -259,7 +259,7 @@ describe("intent-only routing (switch policy)", () => {
 		state.currentBucket = "code";
 		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" } as Model<any>);
 
-		const r = await state.route(ctx, "hmm", mock(async () => true), mock(() => {}), getThinking("off"));
+		const r = await state.route(ctx, "what is the state of things here right now really", mock(async () => true), mock(() => {}), getThinking("off"));
 		expect(r?.decision.bucket).toBe("code");
 		expect(r?.decision.gated).toBe(true);
 		restore();
@@ -279,7 +279,7 @@ describe("intent-only routing (switch policy)", () => {
 		const state = stateWith({ ...CFG, routing: { switchPolicy: { minMargin: 0.15 } } });
 		state.currentBucket = "quick";
 		const { ctx } = mockCtx({ id: "mini", provider: "openai" });
-		const r = await state.route(ctx, "write a parser", mock(async () => true), mock(() => {}), getThinking("off"));
+		const r = await state.route(ctx, "write a tokenizer and parser for a small language", mock(async () => true), mock(() => {}), getThinking("off"));
 		expect(r?.decision.bucket).toBe("code");
 		expect(r?.switched).toBe(true);
 		restore();
@@ -292,10 +292,81 @@ describe("classify fallback (switchPolicy:false)", () => {
 		const state = stateWith({ ...CFG, routing: { switchPolicy: false } });
 		state.currentBucket = "code";
 		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" });
-		const r = await state.route(ctx, "ambiguous ask", mock(async () => true), mock(() => {}), getThinking("off"));
+		const r = await state.route(ctx, "give me your best guess on how to proceed here", mock(async () => true), mock(() => {}), getThinking("off"));
 		expect(r?.decision.bucket).toBe("quick");
 		expect(r?.switched).toBe(true);
 		restore();
+	});
+});
+
+describe("small-signal switch gate (minSwitchChars)", () => {
+	test("tiny followup with incumbent: no laya call, incumbent held", async () => {
+		let calls = 0;
+		const original = globalThis.fetch;
+		globalThis.fetch = (async () => {
+			calls++;
+			return new Response(JSON.stringify({ answers: { route: { choice: "quick", answer_confidence: 0.9 } } }), { status: 200 });
+		}) as typeof fetch;
+		const state = stateWith(CFG);
+		state.currentBucket = "code";
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" });
+
+		const r = await state.route(ctx, "yes, do it", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r).toBeUndefined();
+		expect(calls).toBe(0);
+		expect(state.currentBucket).toBe("code");
+		expect(state.lastDecision).toContain("held code");
+		globalThis.fetch = original;
+	});
+
+	test("data-heavy paste: code stripped, prose below gate, incumbent held", async () => {
+		let calls = 0;
+		const original = globalThis.fetch;
+		globalThis.fetch = (async () => {
+			calls++;
+			return new Response(JSON.stringify({ answers: { route: { choice: "quick", answer_confidence: 0.9 } } }), { status: 200 });
+		}) as typeof fetch;
+		const state = stateWith(CFG);
+		state.currentBucket = "code";
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" });
+
+		const log = "2026-02-06 ERROR auth middleware: token expired at 12:00:01\n".repeat(200);
+		await state.route(ctx, `here is the log:\n\`\`\`${log}\`\`\`\nanalyze this`, mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(calls).toBe(0);
+		expect(state.currentBucket).toBe("code");
+		globalThis.fetch = original;
+	});
+
+	test("tiny first prompt (no incumbent) still routes", async () => {
+		let calls = 0;
+		const original = globalThis.fetch;
+		globalThis.fetch = (async () => {
+			calls++;
+			return new Response(JSON.stringify({ answers: { route: { choice: "code", answer_confidence: 0.9 } } }), { status: 200 });
+		}) as typeof fetch;
+		const state = stateWith(CFG);
+		const { ctx } = mockCtx(undefined);
+
+		const r = await state.route(ctx, "code it", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(calls).toBe(1);
+		expect(r?.decision.bucket).toBe("code");
+		globalThis.fetch = original;
+	});
+
+	test("minSwitchChars: 0 disables the gate", async () => {
+		let calls = 0;
+		const original = globalThis.fetch;
+		globalThis.fetch = (async () => {
+			calls++;
+			return new Response(JSON.stringify({ answers: { route: { choice: "quick", answer_confidence: 0.9 } } }), { status: 200 });
+		}) as typeof fetch;
+		const state = stateWith({ ...CFG, routing: { minSwitchChars: 0 } });
+		state.currentBucket = "code";
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" });
+
+		await state.route(ctx, "yes", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(calls).toBe(1);
+		globalThis.fetch = original;
 	});
 });
 

@@ -40,6 +40,15 @@ export interface RoutingConfig {
 	 * back into raw classify-every-prompt routing (switch on any change).
 	 */
 	switchPolicy?: SwitchPolicyConfig | false;
+	/**
+	 * If the classifiable signal (prose left after code stripping — what laya
+	 * would actually see) is under this many chars, keep the incumbent and skip
+	 * the laya call entirely. Tiny followups ("yes, do it") and data-heavy
+	 * pastes (5KB of logs + "analyze this") are near-noise for switching.
+	 * Only applies when an incumbent exists; the first prompt always routes.
+	 * 0 disables the gate.
+	 */
+	minSwitchChars?: number;
 	/** stateful summarisation: replace history with a cheap-model digest on switch */
 	summarizer?: SummarizerConfig;
 }
@@ -78,6 +87,7 @@ export const DEFAULTS = {
 	healthTimeoutMs: 8000,
 	switchMargin: 0.15,
 	switchMinAbsolute: 0.3,
+	minSwitchChars: 40,
 	summaryMaxTokens: 1024,
 	summaryTimeoutMs: 30000,
 	summaryMinChars: 12000,
