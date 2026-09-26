@@ -96,7 +96,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("laya-router", {
-		description: "Laya model router: status | on | off | reload | routes | test <text> | health",
-		handler: async (args: string, ctx: ExtensionContext) => handleRouterCommand(args, ctx, state),
+		description: "Laya model router: status | on | off | reload | routes | test <text> | health | reroute | pin <route> | unpin",
+		handler: async (args: string, ctx: ExtensionContext) =>
+			handleRouterCommand(args, ctx, state, {
+				setModel: (m) => pi.setModel(m),
+				setThinkingLevel: (l) => pi.setThinkingLevel(l),
+				getThinkingLevel: () => pi.getThinkingLevel(),
+			}),
 	});
 }

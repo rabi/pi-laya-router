@@ -94,6 +94,17 @@ describe("makeSummarizer", () => {
 			() => true,
 			complete as any,
 		);
-		await expect(fn!("text")).rejects.toThrow("empty digest");
+		await expect(fn!("text")).rejects.toThrow("empty digest (stopReason: stop)");
+	});
+
+	test("diagnoses token-budget exhaustion when thinking consumed the output", async () => {
+		const complete = mock(async () => ({ content: [{ type: "thinking", thinking: "..." }], stopReason: "length" }));
+		const fn = makeSummarizer(
+			{ enabled: true, provider: "p", model: "m", maxTokens: 1024 },
+			() => ({ id: "m", provider: "p" }) as any,
+			() => true,
+			complete as any,
+		);
+		await expect(fn!("text")).rejects.toThrow("1024-token budget");
 	});
 });

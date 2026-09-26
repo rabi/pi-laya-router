@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleRouterCommand } from "../extensions/laya-router/commands.ts";
 import { RouterState } from "../extensions/laya-router/router.ts";
+import { calibratedSwitchDefaults } from "../extensions/laya-router/types.ts";
+import { validate } from "../extensions/laya-router/config.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import type { RouterConfig, ThinkingLevel } from "../extensions/laya-router/types.ts";
@@ -70,6 +72,16 @@ function stateWith(cfg: RouterConfig) {
 	state.cfg = structuredClone(cfg);
 	return state;
 }
+
+// keep every test's default decision log out of the real agent dir
+const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+beforeEach(() => {
+	process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "agentdir-"));
+});
+afterEach(() => {
+	if (savedAgentDir !== undefined) process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+	else delete process.env.PI_CODING_AGENT_DIR;
+});
 
 describe("RouterState.route", () => {
 	test("without config returns undefined", async () => {
@@ -311,6 +323,100 @@ describe("classify fallback (switchPolicy:false)", () => {
 	});
 });
 
+describe("per-route minScore floor", () => {
+	const floorCfg = (floor: number): RouterConfig => ({
+		...CFG,
+		routes: { ...CFG.routes, code: { ...CFG.routes.code, minScore: floor } },
+	});
+
+	test("intent: top route below its floor drops to next-best route, not default", async () => {
+		const restore = stubScores({ quick: 0.3, code: 0.4 });
+		const state = stateWith({ ...floorCfg(0.5), routing: { switchPolicy: { minMargin: 0.15, minAbsolute: 0.2 } } });
+		const { ctx } = mockCtx(undefined);
+		const r = await state.route(ctx, "write a parser for the tiny language in this repo", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("quick");
+		expect(r?.decision.gated).toBe(true);
+		expect(r?.decision.reason).toContain("below its minScore floor");
+		restore();
+	});
+
+	test("intent: incumbent below its own floor loses margin protection", async () => {
+		const restore = stubScores({ quick: 0.45, code: 0.4 });
+		const state = stateWith({ ...floorCfg(0.5), routing: { switchPolicy: { minMargin: 0.15, minAbsolute: 0.2 } } });
+		state.currentBucket = "code";
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" } as Model<any>);
+		const setModel = mock(async () => true);
+		const r = await state.route(ctx, "explain how the parser handles this grammar", setModel, mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("quick");
+		expect(r?.switched).toBe(true);
+		expect(setModel).toHaveBeenCalledTimes(1);
+		restore();
+	});
+
+	test("intent: incumbent above its floor keeps margin protection", async () => {
+		const restore = stubScores({ quick: 0.45, code: 0.55 });
+		const state = stateWith({ ...floorCfg(0.5), routing: { switchPolicy: { minMargin: 0.15, minAbsolute: 0.2 } } });
+		state.currentBucket = "code";
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" } as Model<any>);
+		const setModel = mock(async () => true);
+		const r = await state.route(ctx, "explain how the parser handles this grammar", setModel, mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("code");
+		expect(r?.switched).toBe(false);
+		expect(setModel).not.toHaveBeenCalled();
+		restore();
+	});
+
+	test("intent: no route clears its floor keeps incumbent", async () => {
+		const restore = stubScores({ quick: 0.1, code: 0.2 });
+		const state = stateWith({
+			...CFG,
+			routing: { switchPolicy: { minMargin: 0.15, minAbsolute: 0.05 } },
+			routes: { quick: { ...CFG.routes.quick, minScore: 0.15 }, code: { ...CFG.routes.code, minScore: 0.5 } },
+		});
+		state.currentBucket = "code";
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" } as Model<any>);
+		const r = await state.route(ctx, "what is the current state of the parser work here", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("code");
+		expect(r?.decision.gated).toBe(true);
+		restore();
+	});
+
+	test("classify: floor demotes choice to next-best from probabilities", async () => {
+		const original = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ answers: { route: { choice: "code", answer_confidence: 0.45, probabilities: { quick: 0.4, code: 0.45 } } } }), { status: 200 })) as typeof fetch;
+		const state = stateWith({ ...floorCfg(0.5), minConfidence: 0.3, routing: { switchPolicy: false } });
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" });
+		const r = await state.route(ctx, "give me your best guess on how to proceed here", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("quick");
+		expect(r?.decision.gated).toBe(true);
+		globalThis.fetch = original;
+	});
+
+	test("classify: no other eligible route falls back to defaultRoute", async () => {
+		const original = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ answers: { route: { choice: "code", answer_confidence: 0.45, probabilities: { quick: 0.1, code: 0.45 } } } }), { status: 200 })) as typeof fetch;
+		const state = stateWith({
+			...CFG,
+			minConfidence: 0.3,
+			routing: { switchPolicy: false },
+			routes: { quick: { ...CFG.routes.quick, minScore: 0.15 }, code: { ...CFG.routes.code, minScore: 0.5 } },
+		});
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" });
+		const r = await state.route(ctx, "give me your best guess on how to proceed here", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("quick");
+		expect(r?.decision.gated).toBe(true);
+		globalThis.fetch = original;
+	});
+
+	test("validate rejects minScore outside [0,1]", () => {
+		expect(() => validate({ ...CFG, routes: { ...CFG.routes, code: { ...CFG.routes.code, minScore: 1.5 } } })).toThrow(/minScore/);
+		expect(() => validate({ ...CFG, routes: { ...CFG.routes, code: { ...CFG.routes.code, minScore: -0.1 } } })).toThrow(/minScore/);
+		expect(() => validate(floorCfg(0.5))).not.toThrow();
+	});
+});
+
 describe("small-signal switch gate (minSwitchChars)", () => {
 	test("tiny followup with incumbent: no laya call, incumbent held", async () => {
 		let calls = 0;
@@ -492,5 +598,178 @@ describe("RouterState.reload", () => {
 		expect(notifications.some((m) => m.includes("no router.json found"))).toBe(true);
 		if (saved !== undefined) process.env.PI_CODING_AGENT_DIR = saved;
 		process.env.PWD = savedCwd!;
+	});
+});
+
+describe("calibrated switch defaults", () => {
+	test("scale with route count and stay in sane range", () => {
+		expect(calibratedSwitchDefaults(4)).toEqual({ minMargin: 0.0625, minAbsolute: 0.28 });
+		expect(calibratedSwitchDefaults(2).minMargin).toBeCloseTo(0.125);
+		expect(calibratedSwitchDefaults(2).minAbsolute).toBe(0.4); // clamped
+		expect(calibratedSwitchDefaults(16).minMargin).toBe(0.03); // clamped
+	});
+
+	test("small margins switch under calibrated defaults where fixed 0.15 held", async () => {
+		const CFG4 = {
+			...CFG,
+			routes: {
+				...CFG.routes,
+				review: { provider: "openai", model: "mini", description: "review" },
+				investigate: { provider: "openai", model: "mini", description: "investigate" },
+			},
+		};
+		// defaults for 4 routes: margin 0.0625, minAbsolute 0.28
+		const restore = stubScores({ quick: 0.22, code: 0.34, review: 0.22, investigate: 0.22 });
+		const state = stateWith({ ...CFG4, routing: { switchPolicy: {} } });
+		state.currentBucket = "quick";
+		const { ctx } = mockCtx({ id: "mini", provider: "openai" });
+		const r = await state.route(ctx, "explain how the reconciler decides which hosts to provision", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("code");
+		expect(r?.switched).toBe(true);
+		expect(r?.decision.reason).toContain("minMargin");
+		restore();
+	});
+
+	test("near-uniform scores still gate to incumbent", async () => {
+		const restore = stubScores({ quick: 0.24, code: 0.25 });
+		const state = stateWith({ ...CFG, routing: { switchPolicy: {} } });
+		state.currentBucket = "code";
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" });
+		const r = await state.route(ctx, "what should we do about this thing here now", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("code");
+		expect(r?.decision.gated).toBe(true);
+		restore();
+	});
+});
+
+describe("decision log", () => {
+	test("switch and hold decisions are appended with reason and probabilities", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "decisionlog-"));
+		const logPath = join(dir, "decisions.jsonl");
+		const restore = stubScores({ quick: 0.2, code: 0.7 });
+		const state = stateWith({ ...CFG, routing: { decisionLogPath: logPath } });
+		const { ctx } = mockCtx(undefined);
+		await state.route(ctx, "write a parser for the config format", mock(async () => true), mock(() => {}), getThinking("off"));
+
+		const lines = readFileSync(logPath, "utf-8").trim().split("\n");
+		expect(lines.length).toBe(1);
+		const rec = JSON.parse(lines[0]);
+		expect(rec.outcome).toBe("switch");
+		expect(rec.bucket).toBe("code");
+		expect(rec.probabilities).toEqual({ quick: 0.2, code: 0.7 });
+		expect(rec.prompt).toContain("write a parser");
+		restore();
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test("decisionLog:false disables the log", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "decisionlog-"));
+		const logPath = join(dir, "decisions.jsonl");
+		const restore = stubScores({ quick: 0.2, code: 0.7 });
+		const state = stateWith({ ...CFG, routing: { decisionLog: false, decisionLogPath: logPath } });
+		const { ctx } = mockCtx(undefined);
+		await state.route(ctx, "write a parser for the config format", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(existsSync(logPath)).toBe(false);
+		restore();
+		rmSync(dir, { recursive: true, force: true });
+	});
+});
+
+describe("session pin", () => {
+	test("pin switches immediately, holds across prompts, unpin resumes", async () => {
+		let calls = 0;
+		const original = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init: any) => {
+			calls++;
+			return new Response(JSON.stringify({ answers: { route: { choice: "quick", probabilities: { quick: 0.6, code: 0.4 } } } }), { status: 200 });
+		}) as typeof fetch;
+		const state = stateWith(CFG);
+		const { ctx } = mockCtx(undefined);
+		const notifications: [string, string?][] = [];
+		const cmdCtx = { ...ctx, ui: { notify: (m: string, l?: string) => notifications.push([m, l]) } } as unknown as ExtensionContext;
+		const models = { setModel: mock(async () => true), setThinkingLevel: mock(() => {}), getThinkingLevel: getThinking("off") };
+
+		await handleRouterCommand("pin code", cmdCtx, state, models);
+		expect(state.isPinned()).toBe(true);
+		expect((models.setModel.mock.calls[0][0] as Model<any>).id).toBe("opus");
+
+		// pinned: prompts are not classified at all
+		const before = calls;
+		expect(await state.route(ctx, "what is the capital of France and its airports", models.setModel, models.setThinkingLevel, models.getThinkingLevel)).toBeUndefined();
+		expect(calls).toBe(before);
+		expect(state.lastDecision).toContain("pinned code");
+
+		await handleRouterCommand("unpin", cmdCtx, state, models);
+		expect(state.isPinned()).toBe(false);
+		await state.route(ctx, "what is the capital of France and its largest airport", models.setModel, models.setThinkingLevel, models.getThinkingLevel);
+		expect(calls).toBe(before + 1);
+		globalThis.fetch = original;
+	});
+
+	test("pin accepts bare provider/model not in the route table", async () => {
+		const state = stateWith(CFG);
+		const { ctx } = mockCtx(undefined);
+		const models = { setModel: mock(async () => true), setThinkingLevel: mock(() => {}), getThinkingLevel: getThinking("off") };
+		await handleRouterCommand("pin anthropic/opus", ctx, state, models);
+		expect(state.isPinned()).toBe(true);
+		expect(state.pinned).toBe("anthropic/opus");
+		expect(state.pinnedRoute).toEqual({ provider: "anthropic", model: "opus" });
+	});
+
+	test("pin rejects unknown provider/model pair", async () => {
+		const state = stateWith(CFG);
+		const { ctx, notifications } = mockCtx(undefined);
+		ctx.modelRegistry = { find: () => undefined } as never;
+		const models = { setModel: mock(async () => true), setThinkingLevel: mock(() => {}), getThinkingLevel: getThinking("off") };
+		await handleRouterCommand("pin ghost/nope", ctx, state, models);
+		expect(state.isPinned()).toBe(false);
+		expect(notifications.some(([m]) => m.includes("no model ghost/nope in registry"))).toBe(true);
+	});
+
+	test("pin with unknown route errors and does not pin", async () => {
+		const state = stateWith(CFG);
+		const { ctx, notifications } = mockCtx(undefined);
+		const models = { setModel: mock(async () => true), setThinkingLevel: mock(() => {}), getThinkingLevel: getThinking("off") };
+		await handleRouterCommand("pin nope", ctx, state, models);
+		expect(state.isPinned()).toBe(false);
+		expect(notifications.some(([m]) => m.includes('no route "nope"'))).toBe(true);
+	});
+
+	test("pin failure (no API key) does not pin", async () => {
+		const state = stateWith(CFG);
+		const { ctx, notifications } = mockCtx(undefined);
+		const models = { setModel: mock(async () => false), setThinkingLevel: mock(() => {}), getThinkingLevel: getThinking("off") };
+		await handleRouterCommand("pin code", ctx, state, models);
+		expect(state.isPinned()).toBe(false);
+		expect(notifications.some(([m]) => m.includes("could not switch"))).toBe(true);
+	});
+});
+
+describe("reroute clears incumbent", () => {
+	test("intent mode: reroute drops currentBucket so next prompt routes from scratch", async () => {
+		const state = stateWith(CFG);
+		state.currentBucket = "code";
+		const { ctx } = mockCtx(undefined);
+		await handleRouterCommand("reroute", ctx, state);
+		expect(state.currentBucket).toBeUndefined();
+	});
+});
+
+describe("status shows effective policy", () => {
+	test("default policy values are reported", async () => {
+		const state = stateWith({ ...CFG, routing: {} });
+		const { ctx, notifications } = mockCtx(undefined);
+		await handleRouterCommand("", ctx, state);
+		expect(notifications[0][0]).toContain("minMargin>=0.125 (default)");
+		expect(notifications[0][0]).toContain("minAbsolute>=0.400 (default)");
+	});
+
+	test("explicit overrides are reported as-is", async () => {
+		const state = stateWith({ ...CFG, routing: { switchPolicy: { minMargin: 0.1, minAbsolute: 0.3 } } });
+		const { ctx, notifications } = mockCtx(undefined);
+		await handleRouterCommand("", ctx, state);
+		expect(notifications[0][0]).toContain("minMargin>=0.100");
+		expect(notifications[0][0]).toContain("minAbsolute>=0.300");
+		expect(notifications[0][0]).not.toContain("minMargin>=0.100 (default)");
 	});
 });

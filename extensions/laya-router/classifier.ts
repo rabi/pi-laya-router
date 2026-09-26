@@ -64,14 +64,39 @@ export async function classify(
 	// laya's `confidence` is a concentration statistic (runner-up spread), not
 	// P(correct) — with many routes it sits low even on clear-cut answers.
 	// `answer_confidence` is the probability mass on the chosen label.
-	const confidence = ans.answer_confidence ?? ans.confidence ?? 0;
+	let confidence = ans.answer_confidence ?? ans.confidence ?? 0;
 
-	// Unknown or low-confidence labels fall back to defaultRoute — small models
-	// hallucinate bucket names, and the gate exists for exactly these answers.
 	let bucket = ans.choice;
 	let gated = false;
 	const minConf = cfg.minConfidence ?? 0.5;
-	if ((!cfg.routes[bucket] || confidence < minConf) && cfg.defaultRoute && cfg.routes[cfg.defaultRoute]) {
+	const floor = cfg.routes[bucket]?.minScore;
+	if (cfg.routes[bucket] && floor !== undefined && confidence < floor) {
+		// Expensive route not clearly asked for: take the next-best route that
+		// clears its own floor; defaultRoute only when nothing else qualifies.
+		let next: string | undefined;
+		let nextScore = -1;
+		const probs = ans.probabilities;
+		if (probs) {
+			for (const [b, s] of Object.entries(probs)) {
+				if (b === bucket || !cfg.routes[b] || typeof s !== "number") continue;
+				if (s < (cfg.routes[b].minScore ?? 0)) continue;
+				if (s > nextScore) {
+					next = b;
+					nextScore = s;
+				}
+			}
+		}
+		if (next) {
+			bucket = next;
+			confidence = nextScore;
+			gated = true;
+		} else if (cfg.defaultRoute && cfg.routes[cfg.defaultRoute]) {
+			bucket = cfg.defaultRoute;
+			gated = true;
+		}
+	} else if ((!cfg.routes[bucket] || confidence < minConf) && cfg.defaultRoute && cfg.routes[cfg.defaultRoute]) {
+		// Unknown or low-confidence labels fall back to defaultRoute — small
+		// models hallucinate bucket names, and the gate exists for these answers.
 		bucket = cfg.defaultRoute;
 		gated = true;
 	}

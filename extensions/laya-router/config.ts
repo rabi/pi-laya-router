@@ -87,6 +87,9 @@ export function validate(cfg: Partial<RouterConfig>): RouterConfig {
 		if (!r.description) {
 			throw new ConfigError(`route "${name}" must define "description" (used as classification criteria)`);
 		}
+		if (r.minScore !== undefined && (typeof r.minScore !== "number" || r.minScore < 0 || r.minScore > 1)) {
+			throw new ConfigError(`route "${name}" minScore must be a number between 0 and 1`);
+		}
 	}
 	if (cfg.defaultRoute && !cfg.routes[cfg.defaultRoute]) {
 		throw new ConfigError(`"defaultRoute" is "${cfg.defaultRoute}" but no such route exists`);

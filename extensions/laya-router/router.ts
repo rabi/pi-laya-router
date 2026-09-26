@@ -3,7 +3,8 @@ import { DEFAULT_COMPACTION_SETTINGS, estimateTokens } from "@earendil-works/pi-
 import { ConfigError, loadConfig, maxPromptChars } from "./config.ts";
 import { classify, classifyState, scoreRoutes } from "./classifier.ts";
 import { makeSummarizer, type SummarizeFn } from "./summarizer.ts";
-import { DEFAULTS, type Decision, type RouterConfig, type ThinkingLevel } from "./types.ts";
+import { calibratedSwitchDefaults, DEFAULTS, type Decision, type RouterConfig, type ThinkingLevel } from "./types.ts";
+import { appendDecision } from "./decisionlog.ts";
 
 /**
  * Mirror pi's prepareCompaction() no-op condition so compact() never throws
@@ -35,6 +36,15 @@ export function hasCompactableHistory(sessionManager: { buildSessionProjection: 
 
 export type RoutingMode = "classify" | "sticky" | "intent";
 
+function marginFor(best: number, incumbent: number | undefined): string {
+	return (incumbent === undefined ? best : best - incumbent).toFixed(3);
+}
+
+function excerpt(prompt: string, n = 160): string {
+	const p = prompt.replace(/\s+/g, " ").trim();
+	return p.length > n ? p.slice(0, n) + "…" : p;
+}
+
 export interface RouteResult {
 	decision: Decision;
 	switched: boolean;
@@ -50,6 +60,8 @@ export class RouterState {
 	private manualToggle: boolean | undefined;
 	private baselineThinkingLevel: ThinkingLevel | undefined;
 	private locked = false;
+	pinned: string | undefined;
+	pinnedRoute: { provider: string; model: string } | undefined;
 	summarize: SummarizeFn | undefined;
 	/** set when we triggered compact for a model switch; consumed by session_before_compact */
 	compactingForSwitch = false;
@@ -94,6 +106,8 @@ export class RouterState {
 
 	resetSession(): void {
 		this.locked = false;
+		this.pinned = undefined;
+		this.pinnedRoute = undefined;
 		this.currentBucket = undefined;
 		this.lastDecision = "";
 		this.compactingForSwitch = false;
@@ -107,6 +121,45 @@ export class RouterState {
 
 	unlock(): void {
 		this.locked = false;
+		this.pinned = undefined;
+		this.pinnedRoute = undefined;
+	}
+
+	isPinned(): boolean {
+		return this.pinned !== undefined;
+	}
+
+	/**
+	 * Pin the session to a route name or a bare "provider/model", applying it
+	 * immediately. Auto-routing stays paused until unlock().
+	 */
+	async pin(
+		target: string,
+		ctx: ExtensionContext,
+		setModel: (m: NonNullable<ExtensionContext["model"]>) => Promise<boolean>,
+		setThinkingLevel: (l: ThinkingLevel) => void,
+		getThinkingLevel: () => ThinkingLevel,
+	): Promise<string | undefined> {
+		if (!this.cfg) return "no valid router.json";
+		let name = target;
+		let route = this.cfg.routes[target] ?? this.cfg.routes[target.toLowerCase()];
+		if (!route && target.includes("/")) {
+			const i = target.indexOf("/");
+			const provider = target.slice(0, i);
+			const model = target.slice(i + 1);
+			if (!ctx.modelRegistry.find(provider, model)) {
+				return `no route "${target}" and no model ${provider}/${model} in registry — routes: ${Object.keys(this.cfg.routes).join(", ")}`;
+			}
+			name = `${provider}/${model}`;
+			route = { provider, model, description: "manual pin" };
+		}
+		if (!route) return `no route "${target}" — known: ${Object.keys(this.cfg.routes).join(", ")}`;
+		const err = await this.apply(ctx, { bucket: name, confidence: 1, gated: false, route }, setModel, setThinkingLevel, getThinkingLevel);
+		if (err === undefined) return `could not switch to ${route.provider}/${route.model}`;
+		this.pinned = name;
+		this.pinnedRoute = { provider: route.provider, model: route.model };
+		appendDecision(this.cfg, { ts: new Date().toISOString(), prompt: "(manual)", outcome: "manual", bucket: name, route: `${route.provider}/${route.model}`, reason: "session pinned" });
+		return undefined;
 	}
 
 	/** Classify prompt and switch model/thinking; skips setModel when already on target. */
@@ -119,6 +172,10 @@ export class RouterState {
 		signal?: AbortSignal,
 	): Promise<RouteResult | undefined> {
 		if (!this.cfg) return undefined;
+		if (this.pinned) {
+			this.lastDecision = `pinned ${this.pinned} -> ${this.pinnedRoute?.provider}/${this.pinnedRoute?.model} (/laya-router unpin to release)`;
+			return undefined;
+		}
 		const mode = this.routingMode();
 		if (mode === "sticky" && this.locked) return undefined;
 
@@ -129,60 +186,119 @@ export class RouterState {
 		const minSwitch = this.cfg.routing?.minSwitchChars ?? DEFAULTS.minSwitchChars;
 		if (minSwitch > 0 && this.currentBucket && classifyState(prompt, maxPromptChars(this.cfg)).length < minSwitch) {
 			this.lastDecision = `held ${this.currentBucket} (prompt signal < ${minSwitch} chars)`;
+			appendDecision(this.cfg, { ts: new Date().toISOString(), prompt: excerpt(prompt), outcome: "hold", bucket: this.currentBucket, reason: `minSwitchChars < ${minSwitch}` });
 			return undefined;
 		}
 
-		const decision =
-			mode === "intent" ? await this.decideByMargin(prompt, signal) : await classify(this.cfg, prompt, signal);
+		let decision: Decision | undefined;
+		let scores: Record<string, number> | undefined;
+		if (mode === "intent") {
+			const r = await this.decideByMargin(prompt, signal);
+			decision = r?.decision;
+			scores = r?.scores;
+		} else {
+			decision = await classify(this.cfg, prompt, signal);
+		}
 		if (!decision?.route) return undefined;
 
 		const switched = await this.apply(ctx, decision, setModel, setThinkingLevel, getThinkingLevel);
+		appendDecision(this.cfg, {
+			ts: new Date().toISOString(),
+			prompt: excerpt(prompt),
+			outcome: switched === undefined ? "error" : decision.gated ? "gate" : switched ? "switch" : "hold",
+			bucket: decision.bucket,
+			route: `${decision.route.provider}/${decision.route.model}`,
+			confidence: decision.confidence,
+			reason: decision.reason,
+			probabilities: scores,
+		});
 		if (switched === undefined) return undefined;
 		if (mode !== "intent") this.locked = true;
 		return { decision, switched };
 	}
 
-	private async decideByMargin(prompt: string, signal?: AbortSignal): Promise<Decision | undefined> {
+	private async decideByMargin(
+		prompt: string,
+		signal?: AbortSignal,
+	): Promise<{ decision: Decision | undefined; scores?: Record<string, number> }> {
 		const cfg = this.cfg!;
-		const scores = await scoreRoutes(cfg, prompt, signal);
-		const margin = cfg.routing?.switchPolicy?.minMargin ?? DEFAULTS.switchMargin;
-		const minAbs = cfg.routing?.switchPolicy?.minAbsolute ?? cfg.minConfidence ?? DEFAULTS.switchMinAbsolute;
+		const scoreMap = await scoreRoutes(cfg, prompt, signal);
+		const scores = Object.fromEntries(scoreMap);
+		const cal = calibratedSwitchDefaults(Object.keys(cfg.routes).length);
+		const margin = cfg.routing?.switchPolicy?.minMargin ?? cal.minMargin;
+		const minAbs = cfg.routing?.switchPolicy?.minAbsolute ?? cal.minAbsolute;
 
+		// Per-route minScore floor: a route below its own floor is ineligible, so
+		// argmax over the rest naturally lands on the next-best qualifying route
+		// rather than the default. The raw (unfloored) argmax is kept so the
+		// decision log can say which route the floor actually demoted.
+		const floorOf = (b: string) => cfg.routes[b]?.minScore;
+		const eligible = (b: string, s: number) => {
+			const f = floorOf(b);
+			return f === undefined || s >= f;
+		};
+		let rawBest: string | undefined;
+		let rawBestScore = -1;
 		let best: string | undefined;
 		let bestScore = -1;
-		for (const [b, s] of scores) {
+		for (const [b, s] of scoreMap) {
+			if (s > rawBestScore) {
+				rawBest = b;
+				rawBestScore = s;
+			}
+			if (!eligible(b, s)) continue;
 			if (s > bestScore) {
 				best = b;
 				bestScore = s;
 			}
 		}
 		const incumbent = this.currentBucket;
-		const incumbentScore = incumbent !== undefined ? scores.get(incumbent) : undefined;
+		const incumbentScore = incumbent !== undefined ? scoreMap.get(incumbent) : undefined;
+		// An incumbent below its own floor loses margin protection: holding an
+		// expensive model on marginal evidence is exactly what the floor prevents.
+		const incumbentProtected = incumbent !== undefined && incumbentScore !== undefined && eligible(incumbent, incumbentScore);
 
 		let bucket: string;
 		let confidence: number;
 		let gated = false;
-		if (best === undefined || bestScore < minAbs) {
+		let reason: string;
+		if (best === undefined) {
+			bucket = incumbent ?? cfg.defaultRoute ?? "";
+			confidence = rawBestScore;
+			gated = true;
+			reason = `no route clears its minScore floor (raw best "${rawBest}" ${rawBestScore.toFixed(3)})`;
+		} else if (bestScore < minAbs) {
 			bucket = incumbent ?? cfg.defaultRoute ?? "";
 			confidence = bestScore;
 			gated = true;
+			reason = `best ${bestScore.toFixed(3)} < minAbsolute ${minAbs.toFixed(3)}`;
 		} else if (
-			incumbent !== undefined &&
+			incumbentProtected &&
 			best !== incumbent &&
-			incumbentScore !== undefined &&
 			bestScore - incumbentScore < margin
 		) {
 			bucket = incumbent;
 			confidence = incumbentScore;
+			reason = `margin ${marginFor(bestScore, incumbentScore)} < minMargin ${margin.toFixed(3)}`;
 		} else {
 			bucket = best;
 			confidence = bestScore;
+			reason = incumbent === undefined ? "first prompt" : `margin ${marginFor(bestScore, incumbentScore)} >= minMargin ${margin.toFixed(3)}`;
+			if (rawBest !== best) {
+				gated = true;
+				reason += `; "${rawBest}" below its minScore floor`;
+			}
 		}
-		const route = cfg.routes[bucket];
-		if (route) return { bucket, confidence, gated, route };
-		const dflt = cfg.defaultRoute ? cfg.routes[cfg.defaultRoute] : undefined;
-		if (!dflt) return undefined;
-		return { bucket: cfg.defaultRoute!, confidence, gated: true, route: dflt };
+		let route = cfg.routes[bucket];
+		if (!route) {
+			const dflt = cfg.defaultRoute ? cfg.routes[cfg.defaultRoute] : undefined;
+			if (!dflt) return { decision: undefined, scores };
+			reason = `bucket "${bucket}" not in routes; ${reason}`;
+			bucket = cfg.defaultRoute!;
+			route = dflt;
+			gated = true;
+		}
+		return { decision: { bucket, confidence, gated, route, reason }, scores };
 	}
 
 	/** Returns true when the model changed, false when it stayed, undefined on failure. */

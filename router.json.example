@@ -13,11 +13,12 @@
     "stickySession": false,
 
     // Intent-only routing is the DEFAULT: re-classify each prompt but switch
-    // only when the challenger clearly beats the incumbent. These knobs are
-    // optional — set them only to tune the defaults.
+    // only when the challenger clearly beats the incumbent. Defaults are
+    // calibrated to the route count N (4 routes: minMargin 0.0625,
+    // minAbsolute 0.28) — set these only to tune away from the calibration.
     // "switchPolicy": {
-    //   "minMargin": 0.15,     // score gap required to leave the current route
-    //   "minAbsolute": 0.3     // below this the prompt matches nothing; stay put
+    //   "minMargin": 0.0625,   // score gap required to leave the current route
+    //   "minAbsolute": 0.28    // below this the prompt matches nothing; stay put
     // },
     // "switchPolicy": false   // opt out: raw classify-every-prompt routing,
     //                         // switches on any classification change (no gate)
@@ -28,15 +29,23 @@
     // near-noise for switching. First prompt always routes. 0 disables.
     // "minSwitchChars": 40
 
+    // Audit trail: every decision (prompt excerpt, probability map, gate that
+    // fired, outcome) is appended to <agentDir>/laya-router-decisions.jsonl,
+    // shown by /laya-router status. false disables; decisionLogPath relocates.
+    // "decisionLog": true
+    // "decisionLogPath": "/var/log/laya-router-decisions.jsonl"
+
     // Cheap-model compaction: on a real model switch, triggers pi's native
     // compaction but intercepts it to use this model for the summary instead
-    // of the (potentially expensive) current model.
+    // of the (potentially expensive) current model. Keep thinkingLevel "off" —
+    // a thinking model burns its maxTokens budget on reasoning and returns an
+    // empty digest; the summary is a mechanical task, not a reasoning one.
     // "summarizer": {
     //   "enabled": true,
     //   "provider": "rhcorp",
     //   "model": "Qwen/Qwen3.8-27B-FP8",
-    //   "thinkingLevel": "low",
-    //   "maxTokens": 1024,
+    //   "thinkingLevel": "off",
+    //   "maxTokens": 2048,
     //   "timeoutMs": 30000
     // }
   },
@@ -44,7 +53,12 @@
     "reasoning": {
       "provider": "local",
       "model": "RedHatAI/Qwen3.8-27B-INT4",
-      "description": "Deep reasoning, math, architecture design, hard debugging"
+      "description": "Deep reasoning, math, architecture design, hard debugging",
+      // Per-route score floor: this route is only picked when laya's score for
+      // it reaches minScore. Expensive models should sit behind a high floor —
+      // below it, the next-best route that clears its own floor wins instead
+      // of the default. Omit to disable.
+      // "minScore": 0.5
     },
     "code": {
       "provider": "openai",

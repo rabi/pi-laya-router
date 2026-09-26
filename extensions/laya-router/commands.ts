@@ -2,6 +2,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { layaHealth } from "./client.ts";
 import { classify } from "./classifier.ts";
 import { configPaths } from "./config.ts";
+import { fmtProbs, tailDecisions } from "./decisionlog.ts";
+import { calibratedSwitchDefaults, DEFAULTS, type ThinkingLevel } from "./types.ts";
 import type { RouterState } from "./router.ts";
 
 const USAGE = [
@@ -9,12 +11,25 @@ const USAGE = [
 	"/laya-router on|off      toggle auto-routing",
 	"/laya-router reload      re-read router.json",
 	"/laya-router routes      routing table + last decision",
-	"/laya-router reroute     drop the session lock; next prompt re-classifies",
+	"/laya-router reroute     force re-classification on the next prompt",
+	"/laya-router pin <route|provider/model>  pin the session (no auto-routing)",
+	"/laya-router unpin       release the session pin",
 	"/laya-router test <text> classify without switching",
 	"/laya-router health      ping remote laya-serve",
 ].join("\n");
 
-export async function handleRouterCommand(args: string, ctx: ExtensionContext, state: RouterState): Promise<void> {
+export interface ModelControls {
+	setModel: (m: NonNullable<ExtensionContext["model"]>) => Promise<boolean>;
+	setThinkingLevel: (l: ThinkingLevel) => void;
+	getThinkingLevel: () => ThinkingLevel;
+}
+
+export async function handleRouterCommand(
+	args: string,
+	ctx: ExtensionContext,
+	state: RouterState,
+	models?: ModelControls,
+): Promise<void> {
 	const notify = ctx.ui.notify.bind(ctx.ui);
 	const arg = args.trim();
 
@@ -33,16 +48,41 @@ export async function handleRouterCommand(args: string, ctx: ExtensionContext, s
 		}
 		case arg === "reroute": {
 			state.unlock();
-			notify("laya-router: session lock cleared — next prompt re-classifies", "info");
+			state.currentBucket = undefined;
+			notify("laya-router: incumbent cleared — next prompt re-classifies from scratch", "info");
+			return;
+		}
+		case arg === "pin" || arg.startsWith("pin "): {
+			const bucket = arg.slice(3).trim();
+			if (!bucket) {
+				notify(`usage: /laya-router pin <${Object.keys(state.cfg?.routes ?? {}).join("|")}>`, "warning");
+				return;
+			}
+			if (!models) {
+				notify("laya-router: pin unavailable in this context", "error");
+				return;
+			}
+			const err = await state.pin(bucket, ctx, models.setModel, models.setThinkingLevel, models.getThinkingLevel);
+			if (err) notify(`laya-router: ${err}`, "error");
+			else notify(`laya-router: session pinned to ${bucket} — auto-routing paused until /laya-router unpin`, "info");
+			return;
+		}
+		case arg === "unpin": {
+			state.unlock();
+			notify("laya-router: pin released — auto-routing resumes", "info");
 			return;
 		}
 		case arg === "reload": {
-			notify(state.cfg ? `laya-router: reloaded (${state.configPaths.join(", ")})` : "laya-router: reload failed", state.cfg ? "info" : "error");
+			if (!state.cfg) {
+				notify("laya-router: reload failed", "error");
+				return;
+			}
+			notify(`laya-router: reloaded (${state.configPaths.join(", ")})\n${policyLine(state)}`, "info");
 			return;
 		}
 		case arg === "routes": {
 			const lines = Object.entries(state.cfg!.routes).map(
-				([name, r]) => `${name}: ${r.provider}/${r.model}${r.thinkingLevel ? ` [thinking=${r.thinkingLevel}]` : ""}`,
+				([name, r]) => `${name}: ${r.provider}/${r.model}${r.thinkingLevel ? ` [thinking=${r.thinkingLevel}]` : ""}${r.minScore !== undefined ? ` [minScore=${r.minScore}]` : ""}`,
 			);
 			lines.push(`default: ${state.cfg!.defaultRoute ?? "(none)"} | minConfidence: ${state.cfg!.minConfidence ?? 0.5}`);
 			if (state.lastDecision) lines.push(`last: ${state.lastDecision}`);
@@ -81,15 +121,21 @@ export async function handleRouterCommand(args: string, ctx: ExtensionContext, s
 				notify(`unknown subcommand "${arg}"\n${USAGE}`, "warning");
 				return;
 			}
+			const recent = tailDecisions(state.cfg!, 5)
+				.reverse()
+				.map((d) => `${d.ts.slice(11, 19)} ${d.outcome} ${d.bucket}${d.confidence !== undefined ? ` (${d.confidence.toFixed(2)})` : ""} — ${d.reason ?? ""}${d.probabilities ? ` [${fmtProbs(d.probabilities)}]` : ""} "${d.prompt.slice(0, 40)}"`);
 			notify(
 				[
 					`routing: ${state.enabled ? "on" : "off"} (mode: ${state.routingMode()})`,
 					`serve: ${state.cfg!.serveUrl} (model ${state.cfg!.model ?? "laya"})`,
-					`routes: ${Object.keys(state.cfg!.routes).join(", ")}`,
-					state.currentBucket ? `current: ${state.currentBucket}` : "",
+					policyLine(state),
+					state.isPinned() ? `PINNED: ${state.pinned} (/laya-router unpin to release)` : state.currentBucket ? `current: ${state.currentBucket}` : "",
+					state.lastDecision ? `last: ${state.lastDecision}` : "",
 					`config: ${state.configPaths.join(", ") || "(none)"}`,
-					`toggle with /laya-router on|off`,
-				].join("\n"),
+					recent.length ? `recent decisions:\n${recent.join("\n")}` : "no decisions logged yet",
+				]
+					.filter(Boolean)
+					.join("\n"),
 				"info",
 			);
 		}
@@ -97,3 +143,14 @@ export async function handleRouterCommand(args: string, ctx: ExtensionContext, s
 }
 
 export { USAGE };
+
+function policyLine(state: RouterState): string {
+	const cfg = state.cfg!;
+	if (cfg.routing?.stickySession) return "policy: sticky session (first prompt locks)";
+	if (cfg.routing?.switchPolicy === false) return "policy: classify-every-prompt (no gate)";
+	const cal = calibratedSwitchDefaults(Object.keys(cfg.routes).length);
+	const m = cfg.routing?.switchPolicy?.minMargin ?? cal.minMargin;
+	const a = cfg.routing?.switchPolicy?.minAbsolute ?? cal.minAbsolute;
+	const def = (v: number, c: number) => `${v.toFixed(3)}${Math.abs(v - c) < 1e-9 ? " (default)" : ""}`;
+	return `policy: minMargin>=${def(m, cal.minMargin)} minAbsolute>=${def(a, cal.minAbsolute)} minSwitchChars=${cfg.routing?.minSwitchChars ?? DEFAULTS.minSwitchChars}`;
+}

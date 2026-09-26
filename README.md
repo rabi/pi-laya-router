@@ -22,7 +22,8 @@ Pick one — they share the same laya classifier and confidence gate:
 
 | Strategy | Config | Behavior |
 |---|---|---|
-| Intent-only (default) | — | Every prompt is scored, but the model switches only when a challenger beats the incumbent's score by `minMargin` (default 0.15). Prompts that match nothing (`< minAbsolute`) keep the incumbent. Tune with `"switchPolicy": { "minMargin": ..., "minAbsolute": ... }`. |
+| Intent-only (default) | — | Every prompt is scored, but the model switches only when a challenger beats the incumbent's score by `minMargin`. Defaults are calibrated to the route count N (`minMargin = clamp(0.25/N)`, `minAbsolute = clamp(1/N + 0.03)` — for 4 routes: 0.0625 / 0.28); laya's distributions sit near the 1/N prior, so fixed thresholds far above it pin the incumbent forever. Tune with `"switchPolicy": { "minMargin": ..., "minAbsolute": ... }`. |
+| Manual pin | `/laya-router pin <route>` | You override the router: the session rides one route's model until `/laya-router unpin`. Survives reloads; cleared on session start. |
 | Session lock | `"stickySession": true` | First prompt picks the model; the rest of the session rides it. Maximum prompt-cache hits. Escape hatch: `/laya-router reroute`. |
 | Classify-every-prompt | `"switchPolicy": false` | Every prompt re-routes, switching on any classification change — no margin gate. Maximum misroute surface, cache thrash on flip-flops. |
 
@@ -32,7 +33,7 @@ Pick one — they share the same laya classifier and confidence gate:
 
 ### Switch summarisation (optional, any strategy)
 
-`routing.summarizer` names a cheap model (provider/model, auth resolved through pi's registry). When a routing decision actually changes the model — the new model's prompt cache is cold anyway — the plugin triggers pi's native session compaction and intercepts it to write the summary with the cheap model instead of the (potentially expensive) current one. The compaction only fires when pi would actually find something to compact — at least two user turns and ≥ `keepRecentTokens` (default 20k) of conversation *since the last compaction*; context from the system prompt or a previous compaction's retained tail doesn't count. Summariser failures fall back to pi's default compaction. `maxInputChars` (default 60000) caps the transcript fed to the cheap model (newest content kept).
+`routing.summarizer` names a cheap model (provider/model, auth resolved through pi's registry). When a routing decision actually changes the model — the new model's prompt cache is cold anyway — the plugin triggers pi's native session compaction and intercepts it to write the summary with the cheap model instead of the (potentially expensive) current one. The compaction only fires when pi would actually find something to compact — at least two user turns and ≥ `keepRecentTokens` (default 20k) of conversation *since the last compaction*; context from the system prompt or a previous compaction's retained tail doesn't count. Summariser failures fall back to pi's default compaction. Keep the summariser's `thinkingLevel` `"off"` — thinking models spend their `maxTokens` budget on reasoning and can return an empty digest. `maxInputChars` (default 60000) caps the transcript fed to the cheap model (newest content kept).
 
 ## Install
 
@@ -68,13 +69,17 @@ Files are merged per-key (`routes`/`routing` merged per-entry), accept `//` and 
 
 `description` per route is the classification criteria — keep them short and mutually distinct; Laya degrades past ~5 buckets.
 
+**Per-route floor (`minScore`).** Optional per-route number in `[0, 1]`: the route is only selected when its own score reaches the floor (probability in intent mode, `answer_confidence` in classify mode). Built for expensive models that should only run on clear intent — below the floor the route is ineligible and the **next-best route that clears its own floor** wins (defaultRoute only when nothing else qualifies); an incumbent sitting below its own floor also loses margin protection. The floor is checked per route, so a 0.5 floor on an expensive route does not starve the cheap ones.
+
 ## Commands
 
-- `/laya-router` — status (routing on/off, serve URL, loaded config paths)
+- `/laya-router` — status: routing on/off, mode, effective switch policy (with `(default)` markers), current/pinned bucket, last decision, last 5 logged decisions
 - `/laya-router on|off` — toggle auto-routing
 - `/laya-router reload` — re-read router.json without restarting pi
 - `/laya-router routes` — routing table + last decision
-- `/laya-router reroute` — drop the session lock; next prompt re-classifies (sticky mode)
+- `/laya-router reroute` — clear the incumbent (and any session lock); next prompt re-classifies from scratch
+- `/laya-router pin <route>` — pin the session to a route's model immediately; auto-routing pauses until `unpin`
+- `/laya-router unpin` — release the pin and resume auto-routing
 - `/laya-router test <text>` — classify without switching (shows confidence and whether the default-route gate fired)
 - `/laya-router health` — ping remote laya-serve
 
@@ -101,3 +106,12 @@ Adding a new decision tool = one `defineTool` in `tools.ts`; adding a route buck
 - Laya confidence is a concentration statistic over the option distribution, **not** P(answer correct). Use `minConfidence` as a sanity gate, not a correctness guarantee.
 - The zero-shot English checkpoint is weak on fine-grained taxonomies (near chance on some published benchmarks). Validate your buckets with `/laya-router test` before trusting `routing.enabled`.
 - If the sidecar is down, routing is skipped with a warning and the current model is kept.
+
+## Decision log
+
+Every routing decision is appended to `<agentDir>/laya-router-decisions.jsonl`
+(`~/.pi/agent/...` by default): timestamp, prompt excerpt, outcome
+(`switch`/`hold`/`gate`/`error`/`manual`), chosen bucket, laya's full
+probability map, and the reason (which gate fired, the margin math). Rotate
+your own log rotation; the file is trimmed at 512 KB. Disable with
+`"routing": { "decisionLog": false }`, relocate with `"decisionLogPath"`.

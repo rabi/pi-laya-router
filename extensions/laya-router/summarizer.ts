@@ -49,7 +49,14 @@ export function makeSummarizer(
 		const msg = await complete(model, { messages: [{ role: "user", content: parts.join("") }] }, params);
 		if (msg.stopReason === "error") throw new Error(msg.errorMessage || "summariser call failed");
 		const text = textOf(msg.content).trim();
-		if (!text) throw new Error("summariser returned empty digest");
+		if (!text) {
+			// A thinking model that burns its token budget on reasoning produces
+			// thinking blocks but no text block — the digest silently vanishes.
+			if (msg.stopReason === "length") {
+				throw new Error(`summariser hit its ${maxTokens}-token budget before producing a digest (likely thinking overhead — set thinkingLevel "off" or raise maxTokens)`);
+			}
+			throw new Error(`summariser returned empty digest (stopReason: ${msg.stopReason ?? "unknown"})`);
+		}
 		return { summary: text, usage: msg.usage };
 	};
 }
