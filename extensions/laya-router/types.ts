@@ -89,7 +89,7 @@ export interface LoadedConfig {
 export interface Decision {
 	bucket: string;
 	confidence: number;
-	/** true when the raw bucket was replaced by defaultRoute due to low confidence */
+	/** true when the raw argmax/choice was overridden (confidence gate, per-route minScore floor, unknown bucket) */
 	gated: boolean;
 	route?: RouteConfig;
 	/** laya's full probability map, when returned */

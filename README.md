@@ -77,7 +77,7 @@ Files are merged per-key (`routes`/`routing` merged per-entry), accept `//` and 
 - `/laya-router on|off` — toggle auto-routing
 - `/laya-router reload` — re-read router.json without restarting pi
 - `/laya-router routes` — routing table + last decision
-- `/laya-router reroute` — clear the incumbent (and any session lock); next prompt re-classifies from scratch
+- `/laya-router reroute` — clear the incumbent, session lock, and any pin; next prompt re-classifies from scratch
 - `/laya-router pin <route>` — pin the session to a route's model immediately; auto-routing pauses until `unpin`
 - `/laya-router unpin` — release the pin and resume auto-routing
 - `/laya-router test <text>` — classify without switching (shows confidence and whether the default-route gate fired)

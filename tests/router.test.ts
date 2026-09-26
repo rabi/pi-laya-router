@@ -410,6 +410,38 @@ describe("per-route minScore floor", () => {
 		globalThis.fetch = original;
 	});
 
+	test("classify: next-best below minConfidence is skipped, falls to defaultRoute", async () => {
+		// Floor demotion must not bypass the global gate: quick (0.4) clears its
+		// own floor but sits under minConfidence (0.5) — it may only be reached
+		// via defaultRoute, keeping the original choice confidence, not 0.4.
+		const original = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ answers: { route: { choice: "code", answer_confidence: 0.45, probabilities: { quick: 0.4, code: 0.45 } } } }), { status: 200 })) as typeof fetch;
+		const state = stateWith({
+			...CFG,
+			minConfidence: 0.5,
+			routing: { switchPolicy: false },
+			routes: { ...CFG.routes, code: { ...CFG.routes.code, minScore: 0.6 } },
+		});
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" });
+		const r = await state.route(ctx, "give me your best guess on how to proceed here", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("quick");
+		expect(r?.decision.confidence).toBe(0.45);
+		expect(r?.decision.gated).toBe(true);
+		globalThis.fetch = original;
+	});
+
+	test("intent: unscored incumbent does not fake a margin in the reason", async () => {
+		const restore = stubScores({ quick: 0.5, code: 0.45 });
+		const state = stateWith({ ...CFG, routing: { switchPolicy: { minMargin: 0.15, minAbsolute: 0.2 } } });
+		state.currentBucket = "gone"; // route deleted from config after reload
+		const { ctx } = mockCtx({ id: "opus", provider: "anthropic" } as Model<any>);
+		const r = await state.route(ctx, "explain how the parser handles this grammar", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.decision.bucket).toBe("quick");
+		expect(r?.decision.reason).toContain("unscored");
+		restore();
+	});
+
 	test("validate rejects minScore outside [0,1]", () => {
 		expect(() => validate({ ...CFG, routes: { ...CFG.routes, code: { ...CFG.routes.code, minScore: 1.5 } } })).toThrow(/minScore/);
 		expect(() => validate({ ...CFG, routes: { ...CFG.routes, code: { ...CFG.routes.code, minScore: -0.1 } } })).toThrow(/minScore/);

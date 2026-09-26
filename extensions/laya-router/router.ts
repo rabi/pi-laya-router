@@ -283,7 +283,11 @@ export class RouterState {
 		} else {
 			bucket = best;
 			confidence = bestScore;
-			reason = incumbent === undefined ? "first prompt" : `margin ${marginFor(bestScore, incumbentScore)} >= minMargin ${margin.toFixed(3)}`;
+			reason = incumbent === undefined
+				? "first prompt"
+				: incumbentScore === undefined
+					? `incumbent "${incumbent}" unscored (route removed?) — taking best "${best}"`
+					: `margin ${marginFor(bestScore, incumbentScore)} >= minMargin ${margin.toFixed(3)}`;
 			if (rawBest !== best) {
 				gated = true;
 				reason += `; "${rawBest}" below its minScore floor`;

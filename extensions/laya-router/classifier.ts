@@ -79,7 +79,9 @@ export async function classify(
 		if (probs) {
 			for (const [b, s] of Object.entries(probs)) {
 				if (b === bucket || !cfg.routes[b] || typeof s !== "number") continue;
-				if (s < (cfg.routes[b].minScore ?? 0)) continue;
+				// The demotion target must clear the global gate too — a route's
+				// floor is an additional constraint, never a bypass of minConfidence.
+				if (s < minConf || s < (cfg.routes[b].minScore ?? 0)) continue;
 				if (s > nextScore) {
 					next = b;
 					nextScore = s;

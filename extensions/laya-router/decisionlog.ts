@@ -22,7 +22,7 @@ const MAX_LOG_BYTES = 512 * 1024;
 
 function trimLog(p: string): void {
 	try {
-		if ((statSync(p).size ?? 0) <= MAX_LOG_BYTES) return;
+		if (statSync(p).size <= MAX_LOG_BYTES) return;
 		const keep = readFileSync(p, "utf-8");
 		const cut = keep.slice(Math.max(0, keep.length - MAX_LOG_BYTES / 2));
 		const nl = cut.indexOf("\n");
