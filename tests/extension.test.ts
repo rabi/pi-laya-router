@@ -180,6 +180,47 @@ describe("extension wiring", () => {
 		expect(result!.compaction!.tokensBefore).toBe(5000);
 	});
 
+	test("session_before_compact cancels silently when signal already aborted", async () => {
+		agentDirWith(ROUTER_JSON);
+		const { fire } = fakePi();
+		ext(fakePi().api);
+		const { api: api2, fire: fire2 } = fakePi();
+		ext(api2);
+		const ctx = fakeCtx();
+		await fire2("session_start", {}, ctx);
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ answers: { route: { choice: "code", answer_confidence: 0.9 } } }), {
+				status: 200,
+			})) as typeof fetch;
+		await fire2("before_agent_start", { prompt: "implement auth" }, ctx);
+
+		const ac = new AbortController();
+		ac.abort();
+		const result = await fire2(
+			"session_before_compact",
+			{
+				type: "session_before_compact",
+				preparation: {
+					firstKeptEntryId: "entry-1",
+					messagesToSummarize: [{ role: "user" as const, content: "old question" }],
+					turnPrefixMessages: [],
+					isSplitTurn: false,
+					tokensBefore: 5000,
+					previousSummary: undefined,
+					fileOps: { readFiles: [], modifiedFiles: [] },
+					settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+				},
+				branchEntries: [],
+				reason: "manual" as const,
+				willRetry: false,
+				signal: ac.signal,
+			},
+			ctx,
+		);
+		expect(result).toEqual({ cancel: true });
+		expect(ctx.ui.notify.mock.calls.some((c: any[]) => String(c[0]).includes("compaction failed"))).toBe(false);
+	});
+
 	test("session_before_compact passes through when not compactingForSwitch", async () => {
 		agentDirWith(ROUTER_JSON);
 		const { api, fire } = fakePi();

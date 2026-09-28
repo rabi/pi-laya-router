@@ -45,6 +45,7 @@ export default function (pi: ExtensionAPI) {
 		if (!state.compactingForSwitch || event.reason !== "manual" || !state.summarize) return undefined;
 
 		const { preparation, signal } = event;
+		if (signal.aborted) return { cancel: true };
 		try {
 			// Serialize all messages to be summarized (including split-turn prefix)
 			const allMessages = [
@@ -65,6 +66,10 @@ export default function (pi: ExtensionAPI) {
 				},
 			};
 		} catch (err) {
+			// A cancellation (Escape, next compact(), session teardown) aborted pi's
+			// compaction controller mid-summarisation. Pi discards the compaction too —
+			// warning about it would be noise.
+			if (signal.aborted) return { cancel: true };
 			ctx.ui.notify(
 				`laya-router: cheap-model compaction failed, falling back to default (${String(err).slice(0, 120)})`,
 				"warning",
