@@ -563,6 +563,51 @@ describe("model switch triggers compaction", () => {
 		restore();
 	});
 
+	test("system-prompt inflation does not trigger compaction", async () => {
+		const restore = stubAnswer("code", 0.9);
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, provider: "openai", model: "cheap" } } });
+		// Real session shape: a large system message precedes the first user turn.
+		// Total span clears the budget, but the tail after the first cut point does
+		// not — pi's cut lands on the first user message and its summarize span is
+		// empty, so compact() would throw "Nothing to compact (session too small)".
+		const projection = {
+			entries: [
+				{ sourceEntry: { type: "message" }, messages: [{ role: "system", content: BIG }] },
+				{ sourceEntry: { type: "message" }, messages: [{ role: "user", content: "first question" }] },
+				{ sourceEntry: { type: "message" }, messages: [{ role: "assistant", content: "ok" }] },
+				{ sourceEntry: { type: "message" }, messages: [{ role: "user", content: "second question" }] },
+				{ sourceEntry: { type: "message" }, messages: [{ role: "assistant", content: "ok" }] },
+			],
+		};
+		const { ctx, compactCalls } = mockCtx({ id: "mini", provider: "openai" } as Model<any>, projection);
+
+		const r = await state.route(ctx, "next prompt", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.switched).toBe(true);
+		expect(state.compactingForSwitch).toBe(false);
+		expect(compactCalls).toHaveLength(0);
+		restore();
+	});
+
+	test("tail without a later cut point does not trigger compaction", async () => {
+		const restore = stubAnswer("code", 0.9);
+		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, provider: "openai", model: "cheap" } } });
+		// One user turn, then a big tool result. The tail clears the budget but has
+		// no cut point for pi's cut to advance to — same no-op, different shape.
+		const projection = {
+			entries: [
+				{ sourceEntry: { type: "message" }, messages: [{ role: "user", content: BIG }] },
+				{ sourceEntry: { type: "message" }, messages: [{ role: "toolResult", content: BIG }] },
+			],
+		};
+		const { ctx, compactCalls } = mockCtx({ id: "mini", provider: "openai" } as Model<any>, projection);
+
+		const r = await state.route(ctx, "next prompt", mock(async () => true), mock(() => {}), getThinking("off"));
+		expect(r?.switched).toBe(true);
+		expect(state.compactingForSwitch).toBe(false);
+		expect(compactCalls).toHaveLength(0);
+		restore();
+	});
+
 	test("nothing new since last compaction does not trigger compaction", async () => {
 		const restore = stubAnswer("code", 0.9);
 		const state = stateWith({ ...CFG, routing: { summarizer: { enabled: true, provider: "openai", model: "cheap" } } });

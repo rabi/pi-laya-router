@@ -6,29 +6,38 @@ import { makeSummarizer, type SummarizeFn } from "./summarizer.ts";
 import { calibratedSwitchDefaults, DEFAULTS, type Decision, type RouterConfig, type ThinkingLevel } from "./types.ts";
 import { appendDecision } from "./decisionlog.ts";
 
+/** Roles pi treats as compaction cut points (isCutPointMessage). */
+const CUT_POINT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
+
 /**
  * Mirror pi's prepareCompaction() no-op condition so compact() never throws
- * "Nothing to compact (session too small)": the summarizable span — entries
- * after the latest compaction — needs at least two user turns (below that the
- * cut never moves past the first cut point) and its message tokens must reach
- * keepRecentTokens (default 20k), since the cut only advances once the recent
- * tail fills that budget. Usage-based checks are wrong here: they include the
- * system prompt + tool schemas, while pi's budget counts session messages only.
+ * "Nothing to compact (session too small)". pi walks the session tail
+ * back-to-front accumulating raw message tokens (system messages included)
+ * until it reaches keepRecentTokens, then places the cut at the first cut
+ * point at or after the crossing. The span to summarize is everything before
+ * the cut with system messages stripped, so the cut must land strictly after
+ * the span's first cut point. That requires two things: a second cut point
+ * exists (with only one, the cut can never move past the first), and the tail
+ * after the first cut point alone fills the budget — tokens before it (e.g.
+ * injected system messages) inflate the crossing but land in an empty span.
+ * Checked against pi's projection, not usage: usage includes system prompt +
+ * tool schemas, while pi's budget counts session messages only.
  */
 export function hasCompactableHistory(sessionManager: { buildSessionProjection: () => { entries: { sourceEntry: { type: string }; messages: any[] }[] } }): boolean {
 	try {
 		const entries = sessionManager.buildSessionProjection().entries;
-		const prevCompactionIndex = entries.findIndex((e) => e.sourceEntry.type === "compaction" && e.messages.length > 0);
+		const isCutPoint = (e: any) => e.sourceEntry.type !== "compaction" && e.messages.some((m: any) => CUT_POINT_ROLES.has(m.role));
+		const prevCompactionIndex = entries.findIndex((e: any) => e.sourceEntry.type === "compaction" && e.messages.length > 0);
 		const boundary = prevCompactionIndex >= 0 ? prevCompactionIndex + 1 : 0;
-		let tokens = 0;
-		let userTurns = 0;
-		for (let i = boundary; i < entries.length; i++) {
-			for (const m of entries[i].messages) {
-				tokens += estimateTokens(m);
-				if (m.role === "user") userTurns++;
-			}
+		const firstCut = entries.findIndex((e: any, i: number) => i >= boundary && isCutPoint(e));
+		if (firstCut === -1) return false;
+		let tailTokens = 0;
+		let hasLaterCutPoint = false;
+		for (let i = firstCut + 1; i < entries.length; i++) {
+			for (const m of entries[i].messages) tailTokens += estimateTokens(m);
+			if (isCutPoint(entries[i])) hasLaterCutPoint = true;
 		}
-		return userTurns >= 2 && tokens >= DEFAULT_COMPACTION_SETTINGS.keepRecentTokens;
+		return hasLaterCutPoint && tailTokens >= DEFAULT_COMPACTION_SETTINGS.keepRecentTokens;
 	} catch {
 		return false;
 	}
